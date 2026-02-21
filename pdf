@@ -3,7 +3,7 @@ import openpyxl
 import calendar
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Font, Alignment
 from openpyxl.utils import get_column_letter
 
 # ── CONFIG ───────────────────────────────────────────────────────────────────
@@ -28,15 +28,10 @@ def find_col(df_cols, candidates):
 
 
 def next_month_last_date(date_val) -> str:
-    """
-    Given a date (string or datetime), return the last day of the NEXT month.
-    Example: 30 Oct 2025 → 30 Nov 2025
-    """
     if pd.isna(date_val) or str(date_val).strip() in ("", "nan", "NaT"):
         return ""
     try:
         if isinstance(date_val, str):
-            # Try common formats
             for fmt in ("%d %b %Y", "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y"):
                 try:
                     dt = datetime.strptime(date_val.strip(), fmt)
@@ -44,17 +39,13 @@ def next_month_last_date(date_val) -> str:
                 except ValueError:
                     continue
             else:
-                dt = pd.to_datetime(date_val, dayfirst=True)
-                dt = dt.to_pydatetime()
+                dt = pd.to_datetime(date_val, dayfirst=True).to_pydatetime()
         else:
             dt = pd.to_datetime(date_val).to_pydatetime()
 
-        # Move to next month
         next_month = dt + relativedelta(months=1)
-        # Last day of that next month
-        last_day = calendar.monthrange(next_month.year, next_month.month)[1]
-        nav_date = next_month.replace(day=last_day)
-        return nav_date.strftime("%d %b %Y")   # e.g. "30 Nov 2025"
+        last_day   = calendar.monthrange(next_month.year, next_month.month)[1]
+        return next_month.replace(day=last_day).strftime("%d %b %Y")
     except Exception as e:
         print(f"[WARNING] Could not parse date '{date_val}': {e}")
         return str(date_val)
@@ -66,8 +57,6 @@ def load_workflow(path):
     print(f"[Workflow] Reading sheet: '{sheet_name}'")
 
     raw = pd.read_excel(path, sheet_name=sheet_name, header=0, dtype=str)
-
-    # Auto-detect header row
     for i, row in raw.iterrows():
         if any("fund" in str(v).lower() for v in row.values):
             raw = pd.read_excel(path, sheet_name=sheet_name, header=i, dtype=str)
@@ -78,23 +67,14 @@ def load_workflow(path):
 
 
 def map_and_export(extracted_df):
-    """
-    Merges extracted_df (from day_nav8.py) with workflow Excel and writes output.
-
-    Column logic:
-        Prev NAV (thous)  ← NAV (thous) column FROM workflow
-        NAV (thous)       ← Net Assets from PDF / 1000
-        NAV Date          ← last day of next month after workflow DATE
-        Variance          ← NAV (thous) [extracted] - Prev NAV [workflow]
-    """
     # ── 1. Load workflow ─────────────────────────────────────────────────────
     wf = load_workflow(WORKFLOW_PATH)
 
     col_ucn  = find_col(wf.columns, ["Fund UCN", "UCN"])
     col_name = find_col(wf.columns, ["Fund Name", "Name"])
     col_code = find_col(wf.columns, ["Fund Code", "FundCode"])
-    col_nav  = find_col(wf.columns, ["NAV (thous)", "NAV(thous)", "NAV"])   # ← Prev NAV source
-    col_date = find_col(wf.columns, ["DATE", "Start Date", "Nav Date"])     # ← base date for NAV Date
+    col_nav  = find_col(wf.columns, ["NAV (thous)", "NAV(thous)", "NAV"])
+    col_date = find_col(wf.columns, ["DATE", "Start Date", "Nav Date"])
 
     print(f"[Workflow] Columns → UCN:{col_ucn} | Name:{col_name} | "
           f"Code:{col_code} | NAV:{col_nav} | Date:{col_date}")
@@ -107,7 +87,6 @@ def map_and_export(extracted_df):
         net_assets = float(str(ext_row["Net Assets"]).replace(",", "").replace("$", ""))
         mtd_pct    = float(ext_row["Month to Date"])
 
-        # Match workflow row by Fund Code
         if col_code:
             mask  = wf[col_code].str.strip().str.upper() == fund_code.strip().upper()
             match = wf[mask]
@@ -120,88 +99,66 @@ def map_and_export(extracted_df):
 
         wf_row = match.iloc[0]
 
-        # ── MODIFICATION 1 & 2 ──────────────────────────────────────────────
-        # Prev NAV = workflow NAV (thous)  [the old/current nav from workflow]
+        nav_val = int(round(net_assets / 1000, 0))
+
         try:
-            prev_nav = float(str(wf_row[col_nav]).replace(",", "").replace("$", "")) if col_nav else 0.0
+            prev_nav = int(round(float(str(wf_row[col_nav]).replace(",", "").replace("$", "")), 0)) if col_nav else 0
         except (ValueError, TypeError):
-            prev_nav = 0.0
+            prev_nav = 0
 
-        # NAV = extracted Net Assets as-is (no division)
-        nav_thous = round(net_assets, 3)
-
-        # ── MODIFICATION 3 ──────────────────────────────────────────────────
-        # NAV Date = last day of next month after workflow DATE
-        raw_date = wf_row[col_date] if col_date else ""
-        nav_date = next_month_last_date(raw_date)
-
-        # ── MODIFICATION 4 ──────────────────────────────────────────────────
-        # Variance = extracted NAV (thous) - Prev NAV (workflow thous)
-        variance = round(nav_thous - prev_nav, 3)
+        variance = int(round((nav_val - prev_nav) / prev_nav, 0)) if prev_nav != 0 else 0
+        nav_date = next_month_last_date(wf_row[col_date] if col_date else "")
 
         rows.append({
             "Fund UCN":         wf_row[col_ucn]  if col_ucn  else "",
             "Fund Name":        wf_row[col_name] if col_name else pdf_fund,
             "Fund Code":        fund_code,
-            "NAV Date":         nav_date,                  # mod 3: next month last day
-            "NAV":              nav_thous,                 # raw extracted value
-            "MTD (%)":          mtd_pct,
-            "Prev NAV (thous)": round(prev_nav, 3),        # mod 1: from workflow
-            "Variance (thous)": variance,                  # mod 4: new - prev
+            "NAV Date":         nav_date,
+            "NAV (thous)":      nav_val,
+            "MTD":              mtd_pct,
+            "Prev NAV (thous)": prev_nav,
+            "Variance":         variance,
         })
 
     if not rows:
         print("[ERROR] No rows mapped. Check FUND_CODE_MAP keys match PDF fund names.")
         return
 
-    out_df = pd.DataFrame(rows)
+    # Sort ascending by Variance
+    out_df = pd.DataFrame(rows).sort_values("Variance", ascending=True).reset_index(drop=True)
+
     print("\n[Output Preview]")
     print(out_df.to_string(index=False))
 
-    # ── 3. Write formatted Excel ─────────────────────────────────────────────
+    # ── 3. Write plain Excel (no colours, no fills) ───────────────────────────
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "NAV Output"
 
-    thin   = Side(style="thin", color="AAAAAA")
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    bold   = Font(name="Calibri", bold=True, size=11)
+    normal = Font(name="Calibri", size=11)
 
-    # Header
-    ws.row_dimensions[1].height = 28
-    h_fill = PatternFill("solid", fgColor="1F4E79")
-    h_font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+    # Header row — bold, no fill
     for ci, h in enumerate(out_df.columns, 1):
         c = ws.cell(row=1, column=ci, value=h)
-        c.fill = h_fill; c.font = h_font; c.alignment = center; c.border = border
+        c.font   = bold
+        c.alignment = Alignment(horizontal="center", vertical="center")
 
-    # Data rows
-    alt  = PatternFill("solid", fgColor="DCE6F1")
-    wht  = PatternFill("solid", fgColor="FFFFFF")
-    dfnt = Font(name="Arial", size=10)
-
+    # Data rows — plain, no colours
     for ri, (_, row) in enumerate(out_df.iterrows(), 2):
-        fill = alt if ri % 2 == 0 else wht
         for ci, val in enumerate(row.values, 1):
             c = ws.cell(row=ri, column=ci, value=val)
-            c.font = dfnt; c.border = border; c.fill = fill
+            c.font   = normal
             hdr = out_df.columns[ci - 1]
-            if any(k in hdr for k in ("NAV", "Prev NAV", "Variance")):
-                c.number_format = "#,##0.000"
-            elif "MTD" in hdr:
-                c.number_format = '0.0"%"'
-            # Variance: green if positive, red if negative
-            if "Variance" in hdr:
-                try:
-                    if float(val) >= 0:
-                        c.font = Font(name="Arial", size=10, color="006100")
-                    else:
-                        c.font = Font(name="Arial", size=10, color="9C0006")
-                except (ValueError, TypeError):
-                    pass
+            if hdr in ("NAV (thous)", "Prev NAV (thous)"):
+                c.number_format = "#,##0"
+            elif hdr == "MTD":
+                c.number_format = "0.0"
+            elif hdr == "Variance":
+                c.number_format = "0"           # rounded to integer, no decimals
 
     # Column widths
-    for ci, w in enumerate([14, 30, 12, 16, 16, 10, 18, 18], 1):
+    for ci, w in enumerate([14, 30, 12, 16, 16, 8, 18, 14], 1):
         ws.column_dimensions[get_column_letter(ci)].width = w
 
     ws.freeze_panes = "A2"
@@ -210,5 +167,4 @@ def map_and_export(extracted_df):
 
 
 # ── ENTRY POINT ───────────────────────────────────────────────────────────────
-# df already defined by: df = extract_from_pdf(PDF_PATH) in day_nav8.py
 map_and_export(df)
