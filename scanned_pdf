@@ -1,3 +1,6 @@
+
+
+
 import pdfplumber
 import pandas as pd
 import re
@@ -284,3 +287,23 @@ folder_path   = r"C:\Your\PDF\Folder\Path"       # <-- Change this
 workflow_path = r"C:\Your\Workflow\File.xlsx"     # <-- Change this
 
 df = extract_and_merge(folder_path, workflow_path)
+
+
+# ── Save to Excel in APPEND mode ─────────────────────────────────────────
+    if os.path.exists(output_path):
+        # File exists → load existing, combine, save back
+        existing_df = pd.read_excel(output_path)
+        combined_df = pd.concat([existing_df, output_df], ignore_index=True)
+        # Drop duplicates based on Fund Name + NAV Date
+        combined_df = combined_df.drop_duplicates(
+            subset=["Fund Name", "NAV Date"], keep="last"
+        )
+        combined_df.to_excel(output_path, index=False)
+        print(f"\n✅ Appended to existing file. Total rows now: {len(combined_df)}")
+    else:
+        # File doesn't exist → create fresh
+        output_df.to_excel(output_path, index=False)
+        print(f"\n✅ Created new output file with {len(output_df)} rows.")
+
+    print(f"   Saved to: {output_path}")
+    return output_df
