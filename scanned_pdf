@@ -1,14 +1,12 @@
 import pdfplumber
 import pandas as pd
 import re
-from rapidfuzz import fuzz
+from difflib import SequenceMatcher
 
 def extract_riva_capital():
     
-    # ── Set your PDF path here ────────────────────────────────────────────────
     pdf_path = "riva_capital.pdf"          # <-- Change this to your actual path
     output_path = "Riva_Capital_Output.xlsx"
-    # ─────────────────────────────────────────────────────────────────────────
 
     row_labels = [
         "Total income",
@@ -27,15 +25,26 @@ def extract_riva_capital():
         "IRR (Unaffiliated LP's Only)",
     ]
 
-    months = ["Jan'25", "Feb'25", "Mar'25", "Apr'25", "May'25", "Jun'25",
-              "Jul'25", "Aug'25", "Sep'25", "Oct'25", "Nov'25", "Dec'25", "YTD'25"]
-
     # ── Extract words from PDF ────────────────────────────────────────────────
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[0]
         words = page.extract_words()
 
+    # ── DEBUG: Print all words to find exact month header format ─────────────
+    print("=" * 60)
+    print("ALL WORDS FOUND IN PDF (first 100):")
+    print("=" * 60)
+    for w in words[:100]:
+        print(f"  text='{w['text']}'  x0={w['x0']:.1f}  top={w['top']:.1f}")
+    print("=" * 60)
+
     # ── Helpers ───────────────────────────────────────────────────────────────
+    def fuzzy_score(a, b):
+        a, b = a.lower(), b.lower()
+        if a in b:
+            return 100
+        return int(SequenceMatcher(None, a, b).ratio() * 100)
+
     def is_number(text):
         t = text.strip()
         return bool(re.match(r'^[-]?\(?\d[\d,\.]*\)?%?$', t)) or t in ['-', '$']
@@ -49,16 +58,37 @@ def extract_riva_capital():
         except ValueError:
             return None
 
-    # ── Detect month column x-positions ──────────────────────────────────────
-    month_pattern = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|YTD)'?\d{2}$", re.I)
-    header_words = [w for w in words if month_pattern.match(w['text'].replace("\u2019", "'"))]
+    # ── Detect month column x-positions (broader pattern) ────────────────────
+    # Tries multiple common formats: Jan'25, Jan-25, Jan 25, January 2025, Jun25
+    month_pattern = re.compile(
+        r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|YTD)[\s'\-]?\d{2,4}$", re.I
+    )
+
+    header_words = []
+    for w in words:
+        cleaned = w['text'].replace("\u2019", "'").replace("\u2018", "'")
+        if month_pattern.match(cleaned):
+            header_words.append(w)
+
+    # ── If still not found, try to detect by looking for adjacent year numbers ─
+    if not header_words:
+        print("⚠ Standard month pattern failed. Trying alternate detection...")
+        month_names = ["jan","feb","mar","apr","may","jun",
+                       "jul","aug","sep","oct","nov","dec","ytd"]
+        header_words = [
+            w for w in words
+            if w['text'].strip().lower()[:3] in month_names
+        ]
 
     if not header_words:
-        raise ValueError("Could not locate month headers in the PDF.")
+        print("\n❌ Could not detect month headers.")
+        print("Please check the words printed above and share them so the pattern can be fixed.")
+        return
 
     header_words.sort(key=lambda w: w['x0'])
     col_x = [(w['text'], w['x0'], w['x1']) for w in header_words]
     print("Detected columns:", [c[0] for c in col_x])
+    months = [c[0] for c in col_x]  # Use whatever format the PDF actually has
 
     def assign_col(word):
         wx = (word['x0'] + word['x1']) / 2
@@ -90,7 +120,7 @@ def extract_riva_capital():
         best_key, best_score = None, 0
         for key in line_keys:
             lt = line_text(key)
-            score = fuzz.partial_ratio(label.lower(), lt.lower())
+            score = fuzzy_score(label, lt)
             if score > best_score:
                 best_score = score
                 best_key = key
@@ -130,5 +160,4 @@ def extract_riva_capital():
     return df
 
 
-# ── Run ───────────────────────────────────────────────────────────────────────
 extract_riva_capital()
