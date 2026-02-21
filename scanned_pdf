@@ -1,205 +1,134 @@
-import re
-import sys
-import json
-import argparse
-from pathlib import Path
-
-import pandas as pd
 import pdfplumber
+import pandas as pd
+import re
+from rapidfuzz import fuzz
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
+def extract_riva_capital():
+    
+    # ── Set your PDF path here ────────────────────────────────────────────────
+    pdf_path = "riva_capital.pdf"          # <-- Change this to your actual path
+    output_path = "Riva_Capital_Output.xlsx"
+    # ─────────────────────────────────────────────────────────────────────────
 
-INPUT_PDF     = "statement.pdf"
-OUTPUT_PREFIX = "financial_data"
+    row_labels = [
+        "Total income",
+        "Total expenses",
+        "Net investment income(loss)",
+        "Net realized gain(loss) on investments",
+        "Net realized gain(loss) on FX",
+        "Net change in unrealized gain(loss) on investments",
+        "Net change in unrealized gain(loss) on FX",
+        "Net increase in partners' capital from operations",
+        "Gross Capital - beginning of period",
+        "Net change in investors' capital from ops",
+        "Capital contributions",
+        "Capital distributions",
+        "Gross Capital, end of period",
+        "IRR (Unaffiliated LP's Only)",
+    ]
 
-MONTHS    = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "YTD"]
-NUMBER_RE = re.compile(r"^[\(\$]?[\d,]+(?:\.\d+)?[\)]?%?$")
+    months = ["Jan'25", "Feb'25", "Mar'25", "Apr'25", "May'25", "Jun'25",
+              "Jul'25", "Aug'25", "Sep'25", "Oct'25", "Nov'25", "Dec'25", "YTD'25"]
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 1 — Extract words with bounding boxes via pdfplumber
-# ══════════════════════════════════════════════════════════════════════════════
-
-def extract_words(pdf_path: str) -> list:
-    """
-    Returns a list of word dicts:
-      { text, x0, x1, top, bottom, page }
-    sorted by page → top (Y) → x0 (X).
-    """
-    print("[1/4] Extracting words with bounding boxes via pdfplumber …")
-    all_words = []
-
+    # ── Extract words from PDF ────────────────────────────────────────────────
     with pdfplumber.open(pdf_path) as pdf:
-        for page_num, page in enumerate(pdf.pages, 1):
-            words = page.extract_words(
-                x_tolerance=3,        # merge chars into words
-                y_tolerance=3,        # same line tolerance
-                keep_blank_chars=False,
-                use_text_flow=False,
-            )
-            for w in words:
-                w["page"] = page_num
-            all_words.extend(words)
-            print(f"  Page {page_num}: {len(words)} words found")
+        page = pdf.pages[0]
+        words = page.extract_words()
 
-    all_words.sort(key=lambda w: (w["page"], round(w["top"] / 3) * 3, w["x0"]))
-    print(f"  ✓ Total words extracted: {len(all_words)}")
-    return all_words
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def is_number(text):
+        t = text.strip()
+        return bool(re.match(r'^[-]?\(?\d[\d,\.]*\)?%?$', t)) or t in ['-', '$']
 
+    def clean_number(text):
+        t = text.strip().replace(',', '').replace('$', '').replace('%', '')
+        if t.startswith('(') and t.endswith(')'):
+            t = '-' + t[1:-1]
+        try:
+            return float(t)
+        except ValueError:
+            return None
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — Group words into lines by Y-position
-# ══════════════════════════════════════════════════════════════════════════════
+    # ── Detect month column x-positions ──────────────────────────────────────
+    month_pattern = re.compile(r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|YTD)'?\d{2}$", re.I)
+    header_words = [w for w in words if month_pattern.match(w['text'].replace("\u2019", "'"))]
 
-def words_to_lines(words: list, y_tolerance: int = 3) -> list:
-    """
-    Group words sharing the same Y-band into text lines.
-    Within each line, words are sorted left→right.
-    Large X-gaps between words become extra spaces (column separators).
-    Returns list of line strings.
-    """
-    print("[2/4] Reconstructing lines from word positions …")
-    if not words:
-        return []
+    if not header_words:
+        raise ValueError("Could not locate month headers in the PDF.")
 
-    # Group by snapped Y
-    rows = {}
-    for w in words:
-        y_key = round(w["top"] / y_tolerance) * y_tolerance
-        rows.setdefault(y_key, []).append(w)
+    header_words.sort(key=lambda w: w['x0'])
+    col_x = [(w['text'], w['x0'], w['x1']) for w in header_words]
+    print("Detected columns:", [c[0] for c in col_x])
 
-    lines = []
-    for y in sorted(rows.keys()):
-        row_words = sorted(rows[y], key=lambda w: w["x0"])
-        line_parts = []
-        prev_x1    = None
-        for w in row_words:
-            if prev_x1 is not None:
-                gap     = w["x0"] - prev_x1
-                spacer  = "    " if gap > 15 else " "
-            else:
-                spacer = ""
-            line_parts.append(spacer + w["text"])
-            prev_x1 = w["x1"]
-        lines.append("".join(line_parts).strip())
+    def assign_col(word):
+        wx = (word['x0'] + word['x1']) / 2
+        best_col, best_dist = None, float('inf')
+        for name, cx0, cx1 in col_x:
+            col_mid = (cx0 + cx1) / 2
+            dist = abs(wx - col_mid)
+            if dist < best_dist:
+                best_dist = dist
+                best_col = name
+        return best_col
 
-    # Remove blank lines
-    lines = [l for l in lines if l]
-    print(f"  ✓ {len(lines)} lines reconstructed.")
-    return lines
+    # ── Group words into lines by y-position ──────────────────────────────────
+    words_sorted = sorted(words, key=lambda w: (round(w['top'] / 4), w['x0']))
+    lines = {}
+    for w in words_sorted:
+        key = round(w['top'] / 4)
+        lines.setdefault(key, []).append(w)
 
+    line_keys = sorted(lines.keys())
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — Parse lines into a structured DataFrame
-# ══════════════════════════════════════════════════════════════════════════════
+    def line_text(key):
+        return " ".join(w['text'] for w in lines[key])
 
-def clean_number(token: str) -> str:
-    token    = token.strip()
-    negative = token.startswith("(") and token.endswith(")")
-    token    = re.sub(r"[$(),]", "", token).strip()
-    return ("-" + token) if (negative and token and not token.startswith("-")) else token
+    # ── Match each label to a line and extract values ─────────────────────────
+    output_rows = []
 
+    for label in row_labels:
+        best_key, best_score = None, 0
+        for key in line_keys:
+            lt = line_text(key)
+            score = fuzz.partial_ratio(label.lower(), lt.lower())
+            if score > best_score:
+                best_score = score
+                best_key = key
 
-def find_header(lines: list) -> tuple:
-    for i, line in enumerate(lines):
-        found = [m for m in MONTHS if m in line]
-        if len(found) >= 6:
-            return i, ["Metric"] + found
-    return None, []
-
-
-def parse_row(line: str) -> tuple:
-    parts   = re.split(r"\s{2,}", line)
-    label   = []
-    numbers = []
-    for p in parts:
-        p = p.strip()
-        if not p:
+        if best_score < 50:
+            print(f"  ⚠ Could not find row: '{label}' (best score {best_score})")
+            row_dict = {"Row Label": label}
+            row_dict.update({m: None for m in months})
+            output_rows.append(row_dict)
             continue
-        if NUMBER_RE.match(p) or p in {"-", "—", "–"}:
-            numbers.append(clean_number(p) if p not in {"-", "—", "–"} else "")
-        elif not numbers:
-            label.append(p)
-    return " ".join(label).strip(), numbers
 
+        print(f"  ✓ '{label}' → '{line_text(best_key)[:80]}' (score {best_score})")
 
-def lines_to_dataframe(lines: list) -> pd.DataFrame:
-    print("[3/4] Parsing table structure …")
-    header_idx, columns = find_header(lines)
+        matched_line = lines[best_key]
+        next_keys = [k for k in line_keys if k > best_key]
+        extra_words = lines[next_keys[0]] if next_keys else []
+        all_words_in_row = matched_line + extra_words
 
-    if header_idx is None:
-        print("  ⚠ Month header row not found — saving all lines as raw text.")
-        return pd.DataFrame({"line": lines})
+        row_dict = {"Row Label": label}
+        row_dict.update({m: None for m in months})
 
-    n_cols = len(columns) - 1
-    rows   = []
-    for line in lines[header_idx + 1:]:
-        label, numbers = parse_row(line)
-        if not label or not numbers:
-            continue
-        numbers = (numbers + [""] * n_cols)[:n_cols]
-        rows.append([label] + numbers)
+        for w in all_words_in_row:
+            if is_number(w['text']):
+                col = assign_col(w)
+                if col and row_dict.get(col) is None:
+                    row_dict[col] = clean_number(w['text'])
 
-    df = pd.DataFrame(rows, columns=columns)
-    for col in df.columns[1:]:
-        df[col] = pd.to_numeric(
-            df[col].astype(str).str.replace(",", "", regex=False),
-            errors="coerce"
-        )
-    print(f"  ✓ {len(df)} rows × {len(df.columns)} columns parsed.")
+        output_rows.append(row_dict)
+
+    # ── Build DataFrame and save ──────────────────────────────────────────────
+    df = pd.DataFrame(output_rows, columns=["Row Label"] + months)
+    print("\nExtracted DataFrame:")
+    print(df.to_string(index=False))
+
+    df.to_excel(output_path, index=False)
+    print(f"\nSaved to {output_path}")
     return df
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 4 — Save outputs
-# ══════════════════════════════════════════════════════════════════════════════
-
-def save_outputs(df: pd.DataFrame, prefix: str, lines: list) -> None:
-    print("[4/4] Saving outputs …")
-    df.to_excel(f"{prefix}.xlsx", index=False)
-    df.to_csv(f"{prefix}.csv",   index=False)
-    with open(f"{prefix}.json", "w") as f:
-        json.dump(df.to_dict(orient="records"), f, indent=2, default=str)
-    with open(f"{prefix}_lines.txt", "w", encoding="utf-8") as f:
-        f.write("\n".join(lines))
-
-    print(f"  ✓ {prefix}.xlsx")
-    print(f"  ✓ {prefix}.csv")
-    print(f"  ✓ {prefix}.json")
-    print(f"  ✓ {prefix}_lines.txt  ← raw reconstructed lines for debugging")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# Entry point
-# ══════════════════════════════════════════════════════════════════════════════
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Extract financial tables from PDFs using pdfplumber word extraction.")
-    parser.add_argument("pdf",   nargs="?", default=INPUT_PDF)
-    parser.add_argument("--out", default=OUTPUT_PREFIX)
-    parser.add_argument("--y-tolerance", type=int, default=3,
-                        help="Y-pixel tolerance for grouping words into rows (default: 3)")
-    args = parser.parse_args()
-
-    if not Path(args.pdf).exists():
-        sys.exit(f"Error: file not found → {args.pdf}")
-
-    print(f"\n{'='*55}")
-    print(f"  Input : {args.pdf}")
-    print(f"  Output: {args.out}.*")
-    print(f"{'='*55}\n")
-
-    words = extract_words(args.pdf)
-    lines = words_to_lines(words, y_tolerance=args.y_tolerance)
-    df    = lines_to_dataframe(lines)
-    save_outputs(df, args.out, lines)
-
-    print("\nPreview — first 10 rows:")
-    print(df.head(10).to_string(index=False))
-    print("\nDone ✓")
-
-
-if __name__ == "__main__":
-    main()
+# ── Run ───────────────────────────────────────────────────────────────────────
+extract_riva_capital()
