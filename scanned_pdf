@@ -307,3 +307,5 @@ df = extract_and_merge(folder_path, workflow_path)
 
     print(f"   Saved to: {output_path}")
     return output_df
+
+fund_ucn  = str(wf_row[wf_fund_ucn_col]).split('.')[0].zfill(12) if wf_fund_ucn_col else None
