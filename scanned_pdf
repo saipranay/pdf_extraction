@@ -1,0 +1,227 @@
+import re
+import sys
+import json
+import argparse
+from pathlib import Path
+
+import pandas as pd
+import pdfplumber
+import fitz   # PyMuPDF
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+
+INPUT_PDF     = "statement.pdf"
+OUTPUT_PREFIX = "financial_data"
+DPI           = 300
+
+MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "YTD"]
+
+NUMBER_RE = re.compile(r"^[\(\$]?[\d,]+(?:\.\d+)?[\)]?%?$")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# METHOD 1 — pdfplumber direct table extraction (no OCR, very fast)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def try_pdfplumber(pdf_path: str) -> pd.DataFrame:
+    print("[Method 1] pdfplumber — direct table extraction …")
+    all_tables = []
+
+    with pdfplumber.open(pdf_path) as pdf:
+        for page_num, page in enumerate(pdf.pages, 1):
+            tables = page.extract_tables()
+            if tables:
+                print(f"  ✓ Page {page_num}: {len(tables)} table(s) found")
+                for table in tables:
+                    if table and len(table) > 1:
+                        df = pd.DataFrame(table[1:], columns=table[0])
+                        all_tables.append(df)
+
+    if all_tables:
+        combined = pd.concat(all_tables, ignore_index=True)
+        print(f"  ✓ {len(combined)} rows extracted — skipping OCR.")
+        return combined
+
+    print("  ✗ No tables detected → falling back to Method 2.")
+    return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# METHOD 2 — fitz (PyMuPDF) text/OCR extraction
+#
+# fitz offers two ways to get text from a scanned PDF:
+#   A) page.get_text("text")    — native text layer (instant, no OCR)
+#   B) page.get_textpage_ocr()  — built-in Tesseract OCR via fitz (no pytesseract)
+#
+# The script tries A first; if the page yields < 50 chars it switches to B.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def extract_text_fitz(pdf_path: str, dpi: int) -> str:
+    print("[Method 2] fitz — extracting text from PDF …")
+    doc        = fitz.open(pdf_path)
+    zoom       = dpi / 72
+    mat        = fitz.Matrix(zoom, zoom)
+    all_text   = []
+    ocr_used   = False
+
+    for i, page in enumerate(doc, 1):
+        # Try native text layer first
+        native_text = page.get_text("text").strip()
+
+        if len(native_text) >= 50:
+            print(f"  Page {i}/{len(doc)}: native text layer used ({len(native_text)} chars)")
+            all_text.append(native_text)
+        else:
+            # Native layer empty → use fitz built-in OCR
+            print(f"  Page {i}/{len(doc)}: running fitz built-in OCR …")
+            try:
+                # get_textpage_ocr renders at the given matrix resolution
+                tp   = page.get_textpage_ocr(flags=0, dpi=dpi, full=True)
+                text = page.get_text("text", textpage=tp).strip()
+                all_text.append(text)
+                ocr_used = True
+            except AttributeError:
+                # Older PyMuPDF versions (<1.21) don't have get_textpage_ocr
+                # Fall back to rendering + extracting via clip
+                print("  ⚠ fitz OCR API not available — using text blocks fallback.")
+                text = page.get_text("blocks")
+                block_text = "\n".join(b[4] for b in text if isinstance(b[4], str))
+                all_text.append(block_text)
+
+    doc.close()
+    if ocr_used:
+        print("  ✓ fitz built-in OCR used (no pytesseract needed).")
+    combined = "\n\n".join(all_text)
+    print(f"  ✓ {len(combined):,} characters extracted.")
+    return combined
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Text → DataFrame
+# ══════════════════════════════════════════════════════════════════════════════
+
+def clean_number(token: str) -> str:
+    token    = token.strip()
+    negative = token.startswith("(") and token.endswith(")")
+    token    = re.sub(r"[$(),]", "", token).strip()
+    return ("-" + token) if (negative and token and not token.startswith("-")) else token
+
+
+def find_header(lines: list) -> tuple:
+    for i, line in enumerate(lines):
+        found = [m for m in MONTHS if m in line]
+        if len(found) >= 6:
+            return i, ["Metric"] + found
+    return None, []
+
+
+def parse_row(line: str) -> tuple:
+    parts   = re.split(r"\s{2,}", line.strip())
+    label   = []
+    numbers = []
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if NUMBER_RE.match(p) or p in {"-", "—", "–"}:
+            numbers.append(clean_number(p) if p not in {"-", "—", "–"} else "")
+        elif not numbers:
+            label.append(p)
+    return " ".join(label).strip(), numbers
+
+
+def text_to_dataframe(raw_text: str) -> pd.DataFrame:
+    print("  Parsing table structure …")
+    lines              = raw_text.splitlines()
+    header_idx, columns = find_header(lines)
+
+    if header_idx is None:
+        print("  ⚠ Month header not found — returning raw lines.")
+        return pd.DataFrame({"raw_text": [l for l in lines if l.strip()]})
+
+    n_cols = len(columns) - 1
+    rows   = []
+    for line in lines[header_idx + 1:]:
+        if not line.strip():
+            continue
+        label, numbers = parse_row(line)
+        if not label or not numbers:
+            continue
+        numbers = (numbers + [""] * n_cols)[:n_cols]
+        rows.append([label] + numbers)
+
+    df = pd.DataFrame(rows, columns=columns)
+    for col in df.columns[1:]:
+        df[col] = pd.to_numeric(
+            df[col].astype(str).str.replace(",", "", regex=False),
+            errors="coerce"
+        )
+    print(f"  ✓ {len(df)} rows × {len(df.columns)} columns.")
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Save outputs
+# ══════════════════════════════════════════════════════════════════════════════
+
+def save_outputs(df: pd.DataFrame, prefix: str, raw_text: str = "") -> None:
+    df.to_excel(f"{prefix}.xlsx", index=False)
+    df.to_csv(f"{prefix}.csv",   index=False)
+    with open(f"{prefix}.json", "w") as f:
+        json.dump(df.to_dict(orient="records"), f, indent=2, default=str)
+    if raw_text:
+        with open(f"{prefix}_raw.txt", "w", encoding="utf-8") as f:
+            f.write(raw_text)
+    print(f"\n  Saved:")
+    print(f"    {prefix}.xlsx")
+    print(f"    {prefix}.csv")
+    print(f"    {prefix}.json")
+    if raw_text:
+        print(f"    {prefix}_raw.txt  ← open this to debug any bad rows")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Entry point
+# ══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Extract financial tables from scanned PDFs — no pytesseract required.")
+    parser.add_argument("pdf",         nargs="?", default=INPUT_PDF)
+    parser.add_argument("--out",       default=OUTPUT_PREFIX)
+    parser.add_argument("--dpi",       type=int, default=DPI,
+                        help="OCR render DPI (default 300, try 400 for small text)")
+    parser.add_argument("--force-ocr", action="store_true",
+                        help="Skip pdfplumber and go straight to fitz")
+    args = parser.parse_args()
+
+    if not Path(args.pdf).exists():
+        sys.exit(f"Error: file not found → {args.pdf}")
+
+    print(f"\n{'='*55}")
+    print(f"  Input : {args.pdf}")
+    print(f"  Output: {args.out}.*")
+    print(f"  DPI   : {args.dpi}")
+    print(f"{'='*55}\n")
+
+    raw_text = ""
+    df       = None
+
+    if not args.force_ocr:
+        df = try_pdfplumber(args.pdf)
+
+    if df is None:
+        raw_text = extract_text_fitz(args.pdf, dpi=args.dpi)
+        df       = text_to_dataframe(raw_text)
+
+    print("\n[Saving]")
+    save_outputs(df, args.out, raw_text)
+
+    print("\nPreview — first 10 rows:")
+    print(df.head(10).to_string(index=False))
+    print("\nDone ✓")
+
+
+if __name__ == "__main__":
+    main()
