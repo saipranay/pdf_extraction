@@ -6,99 +6,92 @@ from pathlib import Path
 
 import pandas as pd
 import pdfplumber
-import fitz   # PyMuPDF
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 
 INPUT_PDF     = "statement.pdf"
 OUTPUT_PREFIX = "financial_data"
-DPI           = 300
 
-MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
-          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "YTD"]
-
+MONTHS    = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+             "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "YTD"]
 NUMBER_RE = re.compile(r"^[\(\$]?[\d,]+(?:\.\d+)?[\)]?%?$")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# METHOD 1 — pdfplumber direct table extraction (no OCR, very fast)
+# STEP 1 — Extract words with bounding boxes via pdfplumber
 # ══════════════════════════════════════════════════════════════════════════════
 
-def try_pdfplumber(pdf_path: str) -> pd.DataFrame:
-    print("[Method 1] pdfplumber — direct table extraction …")
-    all_tables = []
+def extract_words(pdf_path: str) -> list:
+    """
+    Returns a list of word dicts:
+      { text, x0, x1, top, bottom, page }
+    sorted by page → top (Y) → x0 (X).
+    """
+    print("[1/4] Extracting words with bounding boxes via pdfplumber …")
+    all_words = []
 
     with pdfplumber.open(pdf_path) as pdf:
         for page_num, page in enumerate(pdf.pages, 1):
-            tables = page.extract_tables()
-            if tables:
-                print(f"  ✓ Page {page_num}: {len(tables)} table(s) found")
-                for table in tables:
-                    if table and len(table) > 1:
-                        df = pd.DataFrame(table[1:], columns=table[0])
-                        all_tables.append(df)
+            words = page.extract_words(
+                x_tolerance=3,        # merge chars into words
+                y_tolerance=3,        # same line tolerance
+                keep_blank_chars=False,
+                use_text_flow=False,
+            )
+            for w in words:
+                w["page"] = page_num
+            all_words.extend(words)
+            print(f"  Page {page_num}: {len(words)} words found")
 
-    if all_tables:
-        combined = pd.concat(all_tables, ignore_index=True)
-        print(f"  ✓ {len(combined)} rows extracted — skipping OCR.")
-        return combined
-
-    print("  ✗ No tables detected → falling back to Method 2.")
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# METHOD 2 — fitz (PyMuPDF) text/OCR extraction
-#
-# fitz offers two ways to get text from a scanned PDF:
-#   A) page.get_text("text")    — native text layer (instant, no OCR)
-#   B) page.get_textpage_ocr()  — built-in Tesseract OCR via fitz (no pytesseract)
-#
-# The script tries A first; if the page yields < 50 chars it switches to B.
-# ══════════════════════════════════════════════════════════════════════════════
-
-def extract_text_fitz(pdf_path: str, dpi: int) -> str:
-    print("[Method 2] fitz — extracting text from PDF …")
-    doc        = fitz.open(pdf_path)
-    zoom       = dpi / 72
-    mat        = fitz.Matrix(zoom, zoom)
-    all_text   = []
-    ocr_used   = False
-
-    for i, page in enumerate(doc, 1):
-        # Try native text layer first
-        native_text = page.get_text("text").strip()
-
-        if len(native_text) >= 50:
-            print(f"  Page {i}/{len(doc)}: native text layer used ({len(native_text)} chars)")
-            all_text.append(native_text)
-        else:
-            # Native layer empty → use fitz built-in OCR
-            print(f"  Page {i}/{len(doc)}: running fitz built-in OCR …")
-            try:
-                # get_textpage_ocr renders at the given matrix resolution
-                tp   = page.get_textpage_ocr(flags=0, dpi=dpi, full=True)
-                text = page.get_text("text", textpage=tp).strip()
-                all_text.append(text)
-                ocr_used = True
-            except AttributeError:
-                # Older PyMuPDF versions (<1.21) don't have get_textpage_ocr
-                # Fall back to rendering + extracting via clip
-                print("  ⚠ fitz OCR API not available — using text blocks fallback.")
-                text = page.get_text("blocks")
-                block_text = "\n".join(b[4] for b in text if isinstance(b[4], str))
-                all_text.append(block_text)
-
-    doc.close()
-    if ocr_used:
-        print("  ✓ fitz built-in OCR used (no pytesseract needed).")
-    combined = "\n\n".join(all_text)
-    print(f"  ✓ {len(combined):,} characters extracted.")
-    return combined
+    all_words.sort(key=lambda w: (w["page"], round(w["top"] / 3) * 3, w["x0"]))
+    print(f"  ✓ Total words extracted: {len(all_words)}")
+    return all_words
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Text → DataFrame
+# STEP 2 — Group words into lines by Y-position
+# ══════════════════════════════════════════════════════════════════════════════
+
+def words_to_lines(words: list, y_tolerance: int = 3) -> list:
+    """
+    Group words sharing the same Y-band into text lines.
+    Within each line, words are sorted left→right.
+    Large X-gaps between words become extra spaces (column separators).
+    Returns list of line strings.
+    """
+    print("[2/4] Reconstructing lines from word positions …")
+    if not words:
+        return []
+
+    # Group by snapped Y
+    rows = {}
+    for w in words:
+        y_key = round(w["top"] / y_tolerance) * y_tolerance
+        rows.setdefault(y_key, []).append(w)
+
+    lines = []
+    for y in sorted(rows.keys()):
+        row_words = sorted(rows[y], key=lambda w: w["x0"])
+        line_parts = []
+        prev_x1    = None
+        for w in row_words:
+            if prev_x1 is not None:
+                gap     = w["x0"] - prev_x1
+                spacer  = "    " if gap > 15 else " "
+            else:
+                spacer = ""
+            line_parts.append(spacer + w["text"])
+            prev_x1 = w["x1"]
+        lines.append("".join(line_parts).strip())
+
+    # Remove blank lines
+    lines = [l for l in lines if l]
+    print(f"  ✓ {len(lines)} lines reconstructed.")
+    return lines
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 — Parse lines into a structured DataFrame
 # ══════════════════════════════════════════════════════════════════════════════
 
 def clean_number(token: str) -> str:
@@ -117,7 +110,7 @@ def find_header(lines: list) -> tuple:
 
 
 def parse_row(line: str) -> tuple:
-    parts   = re.split(r"\s{2,}", line.strip())
+    parts   = re.split(r"\s{2,}", line)
     label   = []
     numbers = []
     for p in parts:
@@ -131,20 +124,17 @@ def parse_row(line: str) -> tuple:
     return " ".join(label).strip(), numbers
 
 
-def text_to_dataframe(raw_text: str) -> pd.DataFrame:
-    print("  Parsing table structure …")
-    lines              = raw_text.splitlines()
+def lines_to_dataframe(lines: list) -> pd.DataFrame:
+    print("[3/4] Parsing table structure …")
     header_idx, columns = find_header(lines)
 
     if header_idx is None:
-        print("  ⚠ Month header not found — returning raw lines.")
-        return pd.DataFrame({"raw_text": [l for l in lines if l.strip()]})
+        print("  ⚠ Month header row not found — saving all lines as raw text.")
+        return pd.DataFrame({"line": lines})
 
     n_cols = len(columns) - 1
     rows   = []
     for line in lines[header_idx + 1:]:
-        if not line.strip():
-            continue
         label, numbers = parse_row(line)
         if not label or not numbers:
             continue
@@ -157,28 +147,27 @@ def text_to_dataframe(raw_text: str) -> pd.DataFrame:
             df[col].astype(str).str.replace(",", "", regex=False),
             errors="coerce"
         )
-    print(f"  ✓ {len(df)} rows × {len(df.columns)} columns.")
+    print(f"  ✓ {len(df)} rows × {len(df.columns)} columns parsed.")
     return df
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Save outputs
+# STEP 4 — Save outputs
 # ══════════════════════════════════════════════════════════════════════════════
 
-def save_outputs(df: pd.DataFrame, prefix: str, raw_text: str = "") -> None:
+def save_outputs(df: pd.DataFrame, prefix: str, lines: list) -> None:
+    print("[4/4] Saving outputs …")
     df.to_excel(f"{prefix}.xlsx", index=False)
     df.to_csv(f"{prefix}.csv",   index=False)
     with open(f"{prefix}.json", "w") as f:
         json.dump(df.to_dict(orient="records"), f, indent=2, default=str)
-    if raw_text:
-        with open(f"{prefix}_raw.txt", "w", encoding="utf-8") as f:
-            f.write(raw_text)
-    print(f"\n  Saved:")
-    print(f"    {prefix}.xlsx")
-    print(f"    {prefix}.csv")
-    print(f"    {prefix}.json")
-    if raw_text:
-        print(f"    {prefix}_raw.txt  ← open this to debug any bad rows")
+    with open(f"{prefix}_lines.txt", "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    print(f"  ✓ {prefix}.xlsx")
+    print(f"  ✓ {prefix}.csv")
+    print(f"  ✓ {prefix}.json")
+    print(f"  ✓ {prefix}_lines.txt  ← raw reconstructed lines for debugging")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -187,13 +176,11 @@ def save_outputs(df: pd.DataFrame, prefix: str, raw_text: str = "") -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Extract financial tables from scanned PDFs — no pytesseract required.")
-    parser.add_argument("pdf",         nargs="?", default=INPUT_PDF)
-    parser.add_argument("--out",       default=OUTPUT_PREFIX)
-    parser.add_argument("--dpi",       type=int, default=DPI,
-                        help="OCR render DPI (default 300, try 400 for small text)")
-    parser.add_argument("--force-ocr", action="store_true",
-                        help="Skip pdfplumber and go straight to fitz")
+        description="Extract financial tables from PDFs using pdfplumber word extraction.")
+    parser.add_argument("pdf",   nargs="?", default=INPUT_PDF)
+    parser.add_argument("--out", default=OUTPUT_PREFIX)
+    parser.add_argument("--y-tolerance", type=int, default=3,
+                        help="Y-pixel tolerance for grouping words into rows (default: 3)")
     args = parser.parse_args()
 
     if not Path(args.pdf).exists():
@@ -202,21 +189,12 @@ def main():
     print(f"\n{'='*55}")
     print(f"  Input : {args.pdf}")
     print(f"  Output: {args.out}.*")
-    print(f"  DPI   : {args.dpi}")
     print(f"{'='*55}\n")
 
-    raw_text = ""
-    df       = None
-
-    if not args.force_ocr:
-        df = try_pdfplumber(args.pdf)
-
-    if df is None:
-        raw_text = extract_text_fitz(args.pdf, dpi=args.dpi)
-        df       = text_to_dataframe(raw_text)
-
-    print("\n[Saving]")
-    save_outputs(df, args.out, raw_text)
+    words = extract_words(args.pdf)
+    lines = words_to_lines(words, y_tolerance=args.y_tolerance)
+    df    = lines_to_dataframe(lines)
+    save_outputs(df, args.out, lines)
 
     print("\nPreview — first 10 rows:")
     print(df.head(10).to_string(index=False))
