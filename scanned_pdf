@@ -1,244 +1,141 @@
-import pikepdf
+import pdfplumber
 import pandas as pd
 import re
-from difflib import SequenceMatcher
 
-def extract_riva_capital():
+def extract_bright_meadow():
 
-    pdf_path    = "riva_capital.pdf"  # <-- Change this
-    output_path = "Riva_Capital_Output.xlsx"
+    pdf_path = "bright_meadow.pdf"  # <-- Change this to your actual path
 
-    row_labels = [
-        "Total income",
-        "Total expenses",
-        "Net investment income(loss)",
-        "Net realized gain(loss) on investments",
-        "Net realized gain(loss) on FX",
-        "Net change in unrealized gain(loss) on investments",
-        "Net change in unrealized gain(loss) on FX",
-        "Net increase in partners' capital from operations",
-        "Gross Capital - beginning of period",
-        "Net change in investors' capital from ops",
-        "Capital contributions",
-        "Capital distributions",
-        "Gross Capital, end of period",
-        "IRR (Unaffiliated LP's Only)",
-    ]
+    # ── Extract fund name and table from PDF ──────────────────────────────────
+    with pdfplumber.open(pdf_path) as pdf:
+        page  = pdf.pages[0]
+        
+        # Extract fund name from top text
+        full_text = page.extract_text()
+        fund_name = ""
+        if full_text:
+            first_line = full_text.strip().split('\n')[0]
+            fund_name  = first_line.strip()
 
-    # ── Extract raw text stream from PDF using pikepdf ────────────────────────
-    print("Opening PDF with pikepdf...")
-    all_text_chunks = []
+        # Extract table
+        tables = page.extract_tables()
 
-    with pikepdf.open(pdf_path) as pdf:
-        page = pdf.pages[0]
-
-        # Get the raw content stream
-        if "/Contents" in page:
-            contents = page["/Contents"]
-
-            # Contents can be a single stream or an array of streams
-            if isinstance(contents, pikepdf.Array):
-                streams = list(contents)
-            else:
-                streams = [contents]
-
-            for stream in streams:
-                raw = stream.read_bytes()
-                text = raw.decode("latin-1", errors="replace")
-                all_text_chunks.append(text)
-
-    raw_stream = "\n".join(all_text_chunks)
-
-    print("=" * 80)
-    print("RAW STREAM (first 3000 chars):")
-    print("=" * 80)
-    print(raw_stream[:3000])
-    print("=" * 80)
-
-    # ── Extract text using PDF text operators (Tj, TJ, TD, Tm etc.) ──────────
-    # These are standard PDF operators that carry actual text
-    extracted_items = []  # list of (x, y, text)
-
-    # Current text position tracking
-    curr_x, curr_y = 0, 0
-    curr_font_size = 1
-
-    # Pattern to match text positioning + text operators
-    # Tm sets the text matrix: a b c d x y Tm
-    tm_pattern  = re.compile(
-        r'([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+Tm'
-    )
-    # Td/TD moves text position
-    td_pattern  = re.compile(r'([-\d.]+)\s+([-\d.]+)\s+T[dD]')
-    # Tj shows a string
-    tj_pattern  = re.compile(r'\((.*?)\)\s*Tj', re.DOTALL)
-    # TJ shows array of strings/numbers
-    tj_arr_pattern = re.compile(r'\[(.*?)\]\s*TJ', re.DOTALL)
-    # String inside TJ
-    tj_str_pattern = re.compile(r'\((.*?)\)')
-
-    # Split stream into tokens/lines for sequential processing
-    tokens = raw_stream.split('\n')
-
-    for line in tokens:
-        line = line.strip()
-
-        # Update position from Tm
-        tm_match = tm_pattern.search(line)
-        if tm_match:
-            curr_x = float(tm_match.group(5))
-            curr_y = float(tm_match.group(6))
-
-        # Update position from Td
-        td_match = td_pattern.search(line)
-        if td_match:
-            curr_x += float(td_match.group(1))
-            curr_y += float(td_match.group(2))
-
-        # Extract text from Tj
-        for m in tj_pattern.finditer(line):
-            txt = m.group(1)
-            txt = txt.replace('\\(', '(').replace('\\)', ')').replace('\\\\', '\\')
-            if txt.strip():
-                extracted_items.append((curr_x, curr_y, txt))
-
-        # Extract text from TJ array
-        for m in tj_arr_pattern.finditer(line):
-            arr_content = m.group(1)
-            parts = []
-            for sm in tj_str_pattern.finditer(arr_content):
-                s = sm.group(1)
-                s = s.replace('\\(', '(').replace('\\)', ')').replace('\\\\', '\\')
-                parts.append(s)
-            combined = "".join(parts)
-            if combined.strip():
-                extracted_items.append((curr_x, curr_y, combined))
-
-    print(f"\nTotal text items extracted: {len(extracted_items)}")
-    print("\nFirst 80 text items:")
-    for item in extracted_items[:80]:
-        print(f"  x={item[0]:.1f}  y={item[1]:.1f}  text='{item[2]}'")
-
-    if not extracted_items:
-        print("\n❌ No text found in PDF stream.")
-        print("This PDF is a pure image scan — text is stored as pixels, not characters.")
-        print("You need OCR to read it. Options:")
-        print("  • Open in Adobe Acrobat → Tools → Scan & OCR → Recognize Text → Save")
-        print("  • Open in Microsoft Word (it auto-OCRs) → copy table to Excel")
+    if not tables:
+        print("❌ No tables found in PDF.")
         return
 
-    # ── Group items into lines by y-position ──────────────────────────────────
-    lines_dict = {}
-    for x, y, text in extracted_items:
-        key = round(y / 3) * 3   # group within 3 units
-        lines_dict.setdefault(key, []).append((x, text))
+    # ── Use the largest table found ───────────────────────────────────────────
+    table = max(tables, key=lambda t: len(t))
 
-    line_keys = sorted(lines_dict.keys(), reverse=True)  # PDF y increases downward
+    print(f"Fund: {fund_name}")
+    print(f"Table rows found: {len(table)}")
+    print("\nRaw table (first 5 rows):")
+    for row in table[:5]:
+        print(row)
 
-    def line_text(key):
-        items = sorted(lines_dict[key], key=lambda t: t[0])
-        return " ".join(t[1] for t in items)
+    # ── Convert to DataFrame ──────────────────────────────────────────────────
+    # Flatten multi-line headers by joining non-None cells
+    def clean_cell(cell):
+        if cell is None:
+            return ""
+        return " ".join(cell.split())  # collapse whitespace/newlines
 
-    print("\nAll lines:")
-    for k in line_keys:
-        print(f"  y~{k}: {line_text(k)}")
+    # Build clean rows
+    clean_table = [[clean_cell(cell) for cell in row] for row in table]
 
-    # ── Detect month columns ──────────────────────────────────────────────────
-    month_pattern_re = re.compile(
-        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|YTD)[\s'\u2019\-]?\d{2,4}", re.I
-    )
+    # Find header row (row that contains "Period" or "Ending")
+    header_idx = 0
+    for i, row in enumerate(clean_table):
+        row_text = " ".join(row).lower()
+        if "period" in row_text or "ending" in row_text:
+            header_idx = i
+            break
 
-    header_key = None
-    max_hits   = 0
-    for key in line_keys:
-        hits = len(month_pattern_re.findall(line_text(key)))
-        if hits > max_hits:
-            max_hits   = hits
-            header_key = key
+    # Merge header rows if split across multiple rows (common in pdfplumber)
+    # Combine rows up to and including header_idx as column names
+    col_names = []
+    for col_i in range(len(clean_table[header_idx])):
+        parts = []
+        for row_i in range(header_idx + 1):
+            val = clean_table[row_i][col_i]
+            if val:
+                parts.append(val)
+        col_names.append(" ".join(parts).strip())
 
-    if not header_key or max_hits == 0:
-        print("\n❌ Could not find month headers in extracted text.")
+    print(f"\nDetected columns: {col_names}")
+
+    # Data rows start after header
+    data_rows = clean_table[header_idx + 1:]
+    df_full   = pd.DataFrame(data_rows, columns=col_names)
+
+    print("\nFull DataFrame:")
+    print(df_full.to_string(index=False))
+
+    # ── Find December 2025 row ────────────────────────────────────────────────
+    # Period column is likely the first column
+    period_col = col_names[0]
+
+    # Find column containing "Ending Equity"
+    ending_col = next((c for c in col_names if "ending" in c.lower() and "equity" in c.lower()), None)
+
+    # Find column containing "MTD Rate of Return"
+    mtd_col = next((c for c in col_names if "mtd" in c.lower() and "rate" in c.lower()), None)
+
+    # Fallback: search by index if names are messy
+    if not ending_col:
+        # Ending Equity is typically column index 4
+        ending_col = col_names[4] if len(col_names) > 4 else None
+    if not mtd_col:
+        # MTD Rate of Return is typically column index 5
+        mtd_col = col_names[5] if len(col_names) > 5 else None
+
+    print(f"\nEnding Equity column : '{ending_col}'")
+    print(f"MTD Rate of Return column: '{mtd_col}'")
+
+    # Find the 2025 December row
+    # Look for year marker "2025" then "December" after it
+    in_2025    = False
+    dec_row    = None
+
+    for _, row in df_full.iterrows():
+        period_val = str(row[period_col]).strip()
+        if period_val == "2025":
+            in_2025 = True
+        if in_2025 and "december" in period_val.lower():
+            dec_row = row
+            break
+
+    if dec_row is None:
+        print("❌ Could not find December 2025 row.")
+        print("Available periods:", df_full[period_col].tolist())
         return
 
-    print(f"\nHeader line: {line_text(header_key)}")
-
-    # Build col_x from x positions of month words in header line
-    col_x = []
-    for x, text in sorted(lines_dict[header_key], key=lambda t: t[0]):
-        if month_pattern_re.search(text):
-            col_x.append((text, x))
-
-    months = [c[0] for c in col_x]
-    print(f"Months: {months}")
-
-    def assign_col(x_pos):
-        best_col, best_dist = None, float('inf')
-        for name, cx in col_x:
-            dist = abs(x_pos - cx)
-            if dist < best_dist:
-                best_dist = dist
-                best_col  = name
-        return best_col
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-    def fuzzy_score(a, b):
-        a, b = a.lower(), b.lower()
-        if a in b:
-            return 100
-        return int(SequenceMatcher(None, a, b).ratio() * 100)
-
-    def is_number(text):
-        t = text.strip()
-        return bool(re.match(r'^[-]?\(?\d[\d,\.]*\)?%?$', t))
-
-    def clean_number(text):
-        t = text.strip().replace(',', '').replace('$', '').replace('%', '')
-        if t.startswith('(') and t.endswith(')'):
-            t = '-' + t[1:-1]
+    # ── Clean values ──────────────────────────────────────────────────────────
+    def clean_number(val):
+        if val is None or str(val).strip() in ("", "-", "None"):
+            return None
+        v = str(val).replace(',', '').replace('$', '').replace('%', '').strip()
         try:
-            return float(t)
+            return float(v)
         except ValueError:
             return None
 
-    # ── Match labels and extract values ───────────────────────────────────────
-    output_rows = []
+    ending_equity = clean_number(dec_row[ending_col])
+    mtd_return    = clean_number(dec_row[mtd_col])
 
-    for label in row_labels:
-        best_key, best_score = None, 0
-        for key in line_keys:
-            score = fuzzy_score(label, line_text(key))
-            if score > best_score:
-                best_score = score
-                best_key   = key
+    # ── Build output DataFrame ────────────────────────────────────────────────
+    result_df = pd.DataFrame([{
+        "Fund Name"              : fund_name,
+        "Period"                 : "December 2025",
+        "Ending Equity"          : ending_equity,
+        "MTD Rate of Return (%)" : mtd_return
+    }])
 
-        if best_score < 50:
-            print(f"  ⚠ Could not find: '{label}'")
-            row_dict = {"Row Label": label}
-            row_dict.update({m: None for m in months})
-            output_rows.append(row_dict)
-            continue
+    print("\n✅ Final Extracted Data:")
+    print(result_df.to_string(index=False))
 
-        print(f"  ✓ '{label}' → '{line_text(best_key)[:80]}' (score {best_score})")
-
-        row_dict = {"Row Label": label}
-        row_dict.update({m: None for m in months})
-
-        for x, text in lines_dict[best_key]:
-            if is_number(text):
-                col = assign_col(x)
-                if col and row_dict.get(col) is None:
-                    row_dict[col] = clean_number(text)
-
-        output_rows.append(row_dict)
-
-    # ── Save ──────────────────────────────────────────────────────────────────
-    df = pd.DataFrame(output_rows, columns=["Row Label"] + months)
-    print("\nExtracted DataFrame:")
-    print(df.to_string(index=False))
-
-    df.to_excel(output_path, index=False)
-    print(f"\nSaved to {output_path}")
-    return df
+    return result_df
 
 
-extract_riva_capital()
+# ── Run ───────────────────────────────────────────────────────────────────────
+df = extract_bright_meadow()
