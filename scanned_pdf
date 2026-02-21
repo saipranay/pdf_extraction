@@ -1,147 +1,169 @@
 import pdfplumber
 import pandas as pd
 import re
+import os
 
-def extract_bright_meadow(pdf_path):
-    """
-    Works for any PDF in the same format:
-    - Fund name at top
-    - Performance table with year separator rows (2024, 2025)
-    - Columns: Period, Beginning Equity, Additions, Withdrawals,
-               Net Income, Ending Equity, MTD Rate of Return, ...
-    """
+def extract_fund_data(pdf_path):
+    """Extract December ending equity and MTD rate of return from a single PDF."""
 
-    with pdfplumber.open(pdf_path) as pdf:
-        page  = pdf.pages[0]
-        words = page.extract_words(x_tolerance=3, y_tolerance=3)
-        full_text = page.extract_text()
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            page      = pdf.pages[0]
+            words     = page.extract_words(x_tolerance=3, y_tolerance=3)
+            full_text = page.extract_text()
 
-    fund_name = full_text.strip().split('\n')[0].strip() if full_text else ""
+        fund_name = full_text.strip().split('\n')[0].strip() if full_text else ""
 
-    # ── Group words into lines by y position ─────────────────────────────────
-    lines = {}
-    for w in words:
-        key = round(w['top'] / 3) * 3
-        lines.setdefault(key, []).append(w)
+        # ── Group words into lines by y position ─────────────────────────────
+        lines = {}
+        for w in words:
+            key = round(w['top'] / 3) * 3
+            lines.setdefault(key, []).append(w)
 
-    line_keys = sorted(lines.keys())
+        line_keys = sorted(lines.keys())
 
-    def get_line_words(key):
-        return sorted(lines[key], key=lambda w: w['x0'])
+        def get_line_words(key):
+            return sorted(lines[key], key=lambda w: w['x0'])
 
-    def line_text(key):
-        return " ".join(w['text'] for w in get_line_words(key))
+        def line_text(key):
+            return " ".join(w['text'] for w in get_line_words(key))
 
-    # ── Dynamically find column x-centers from headers ────────────────────────
-    # The headers may span multiple lines so we scan all lines for keywords
-    # and record the x-center of each keyword word
+        # ── Dynamically find column x-centers from headers ───────────────────
+        col_x = {"ending_equity": None, "mtd_return": None}
 
-    col_keywords = {
-        "ending_equity" : ["ending"],
-        "mtd_return"    : ["mtd"],
-    }
-
-    col_x = {k: None for k in col_keywords}
-
-    for k in line_keys:
-        for w in get_line_words(k):
-            wt = w['text'].lower()
-            for col_name, keywords in col_keywords.items():
-                if col_x[col_name] is None:
-                    for kw in keywords:
-                        if kw in wt:
-                            col_x[col_name] = (w['x0'] + w['x1']) / 2
-                            print(f"  Found '{col_name}' header → '{w['text']}' at x={col_x[col_name]:.1f}")
-
-    # Check we found both columns
-    missing = [k for k, v in col_x.items() if v is None]
-    if missing:
-        print(f"⚠ Could not find headers for: {missing}")
-        print("All lines:")
         for k in line_keys:
-            print(f"  y={k}: {line_text(k)}")
-        return None
+            for w in get_line_words(k):
+                wt = w['text'].lower()
+                if col_x["ending_equity"] is None and "ending" in wt:
+                    col_x["ending_equity"] = (w['x0'] + w['x1']) / 2
+                if col_x["mtd_return"] is None and "mtd" in wt:
+                    col_x["mtd_return"] = (w['x0'] + w['x1']) / 2
 
-    # ── Find the most recent year marker (highest year number in table) ───────
-    year_keys = {}   # year_value → line_key
-    for k in line_keys:
-        lt = line_text(k).strip()
-        if re.match(r'^\d{4}$', lt):
-            year_keys[int(lt)] = k
-
-    if not year_keys:
-        print("❌ No year marker rows found.")
-        return None
-
-    latest_year     = max(year_keys.keys())
-    latest_year_key = year_keys[latest_year]
-    print(f"\nLatest year in table: {latest_year} at y={latest_year_key}")
-
-    # ── Find December row after the latest year marker ────────────────────────
-    dec_key = None
-    for k in line_keys:
-        if k <= latest_year_key:
-            continue
-        first_word = get_line_words(k)[0]['text'].lower()
-        if "december" in first_word:
-            dec_key = k
-            break
-
-    if dec_key is None:
-        print(f"❌ No December row found after {latest_year}.")
-        print(f"Rows after year marker:")
-        for k in line_keys:
-            if k > latest_year_key:
-                print(f"  y={k}: {line_text(k)}")
-        return None
-
-    print(f"December {latest_year} row at y={dec_key} → {line_text(dec_key)}")
-
-    # ── Extract value at each column x position ───────────────────────────────
-    dec_words = get_line_words(dec_key)
-
-    def get_value_near_x(target_x, row_words, tolerance=50):
-        """Get the word whose x-center is closest to target_x within tolerance."""
-        best_word, best_dist = None, float('inf')
-        for w in row_words:
-            wx    = (w['x0'] + w['x1']) / 2
-            dist  = abs(wx - target_x)
-            if dist < best_dist and dist < tolerance:
-                best_dist = dist
-                best_word = w
-        return best_word['text'] if best_word else None
-
-    def clean_number(val):
-        if not val or str(val).strip() in ("", "-", "None"):
-            return None
-        v = str(val).replace(',', '').replace('$', '').replace('%', '').strip()
-        try:
-            return float(v)
-        except ValueError:
+        if None in col_x.values():
+            print(f"  ⚠ Could not find all column headers in: {os.path.basename(pdf_path)}")
             return None
 
-    ending_raw = get_value_near_x(col_x["ending_equity"], dec_words)
-    mtd_raw    = get_value_near_x(col_x["mtd_return"],    dec_words)
+        # ── Find the most recent year marker ─────────────────────────────────
+        year_keys = {}
+        for k in line_keys:
+            lt = line_text(k).strip()
+            if re.match(r'^\d{4}$', lt):
+                year_keys[int(lt)] = k
 
-    print(f"\nRaw Ending Equity      : '{ending_raw}'")
-    print(f"Raw MTD Rate of Return : '{mtd_raw}'")
+        if not year_keys:
+            print(f"  ⚠ No year marker found in: {os.path.basename(pdf_path)}")
+            return None
 
-    ending_equity = clean_number(ending_raw)
-    mtd_return    = clean_number(mtd_raw)
+        latest_year     = max(year_keys.keys())
+        latest_year_key = year_keys[latest_year]
 
-    result_df = pd.DataFrame([{
-        "Fund Name"              : fund_name,
-        "Period"                 : f"December {latest_year}",
-        "Ending Equity"          : ending_equity,
-        "MTD Rate of Return (%)" : mtd_return
-    }])
+        # ── Find December row after latest year marker ────────────────────────
+        dec_key = None
+        for k in line_keys:
+            if k <= latest_year_key:
+                continue
+            row_words = get_line_words(k)
+            if row_words and "december" in row_words[0]['text'].lower():
+                dec_key = k
+                break
 
-    print("\n✅ Final Extracted Data:")
-    print(result_df.to_string(index=False))
+        if dec_key is None:
+            print(f"  ⚠ No December row found in: {os.path.basename(pdf_path)}")
+            return None
 
-    return result_df
+        # ── Get value nearest to each column x position ───────────────────────
+        dec_words = get_line_words(dec_key)
+
+        def get_value_near_x(target_x, row_words, tolerance=50):
+            best_word, best_dist = None, float('inf')
+            for w in row_words:
+                wx   = (w['x0'] + w['x1']) / 2
+                dist = abs(wx - target_x)
+                if dist < best_dist and dist < tolerance:
+                    best_dist = dist
+                    best_word = w
+            return best_word['text'] if best_word else None
+
+        def clean_number(val):
+            if not val or str(val).strip() in ("", "-", "None"):
+                return None
+            v = str(val).replace(',', '').replace('$', '').replace('%', '').strip()
+            try:
+                return float(v)
+            except ValueError:
+                return None
+
+        ending_equity = clean_number(get_value_near_x(col_x["ending_equity"], dec_words))
+        mtd_return    = clean_number(get_value_near_x(col_x["mtd_return"],    dec_words))
+
+        print(f"  ✅ {fund_name[:60]} | Ending Equity: {ending_equity} | MTD: {mtd_return}")
+
+        return {
+            "Fund Name"              : fund_name,
+            "Period"                 : f"December {latest_year}",
+            "Ending Equity"          : ending_equity,
+            "MTD Rate of Return (%)" : mtd_return
+        }
+
+    except Exception as e:
+        print(f"  ❌ Error processing {os.path.basename(pdf_path)}: {e}")
+        return None
+
+
+def extract_all_funds(folder_path):
+    """Loop through all PDFs in folder and return combined DataFrame."""
+
+    # ── Change folder path here ───────────────────────────────────────────────
+    folder_path = r"C:\Your\Folder\Path\Here"   # <-- Change this
+    # ─────────────────────────────────────────────────────────────────────────
+
+    pdf_files = [
+        f for f in os.listdir(folder_path)
+        if f.lower().endswith(".pdf")
+    ]
+
+    if not pdf_files:
+        print(f"❌ No PDF files found in: {folder_path}")
+        return None
+
+    print(f"Found {len(pdf_files)} PDF files in folder:\n")
+
+    results = []
+    for i, filename in enumerate(sorted(pdf_files), 1):
+        pdf_path = os.path.join(folder_path, filename)
+        print(f"[{i}/{len(pdf_files)}] Processing: {filename}")
+        result = extract_fund_data(pdf_path)
+        if result:
+            results.append(result)
+        else:
+            # Add a blank row so we know which PDF failed
+            results.append({
+                "Fund Name"              : filename,
+                "Period"                 : "ERROR - Could not extract",
+                "Ending Equity"          : None,
+                "MTD Rate of Return (%)" : None
+            })
+
+    # ── Build final DataFrame ─────────────────────────────────────────────────
+    df = pd.DataFrame(results, columns=[
+        "Fund Name",
+        "Period",
+        "Ending Equity",
+        "MTD Rate of Return (%)"
+    ])
+
+    print("\n" + "=" * 70)
+    print("FINAL COMBINED RESULTS:")
+    print("=" * 70)
+    print(df.to_string(index=False))
+
+    # ── Save to Excel ─────────────────────────────────────────────────────────
+    output_path = os.path.join(folder_path, "All_Funds_Extracted.xlsx")
+    df.to_excel(output_path, index=False)
+    print(f"\nSaved to: {output_path}")
+
+    return df
 
 
 # ── Run ───────────────────────────────────────────────────────────────────────
-pdf_path = "bright_meadow.pdf"   # <-- Change this
-df = extract_bright_meadow(pdf_path)
+df = extract_all_funds(r"C:\Your\Folder\Path\Here")  # <-- Change this
