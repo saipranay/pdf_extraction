@@ -4,99 +4,132 @@ import re
 
 def extract_bright_meadow():
 
-    pdf_path = "bright_meadow.pdf"  # <-- Change this to your actual path
+    pdf_path = "bright_meadow.pdf"  # <-- Change this
 
     with pdfplumber.open(pdf_path) as pdf:
-        page = pdf.pages[0]
-
-        # Extract fund name
+        page  = pdf.pages[0]
+        words = page.extract_words(x_tolerance=3, y_tolerance=3)
         full_text = page.extract_text()
-        fund_name = full_text.strip().split('\n')[0].strip() if full_text else ""
 
-        # Extract table
-        tables = page.extract_tables()
-
-    if not tables:
-        print("❌ No tables found.")
-        return
-
-    table = max(tables, key=lambda t: len(t))
-
-    # ── Clean all cells ───────────────────────────────────────────────────────
-    def clean_cell(cell):
-        if cell is None:
-            return ""
-        return " ".join(str(cell).split())
-
-    clean_table = [[clean_cell(c) for c in row] for row in table]
-
-    # ── Debug: print all rows with index ─────────────────────────────────────
+    fund_name = full_text.strip().split('\n')[0].strip() if full_text else ""
     print(f"Fund: {fund_name}")
-    print(f"Total rows: {len(clean_table)}")
-    print("\nAll rows:")
-    for i, row in enumerate(clean_table):
-        print(f"  [{i:03d}] {row}")
 
-    # ── Find column count from the most populated row ─────────────────────────
-    num_cols = max(len(row) for row in clean_table)
+    # ── Group words into lines by y position ─────────────────────────────────
+    lines = {}
+    for w in words:
+        key = round(w['top'] / 3) * 3
+        lines.setdefault(key, []).append(w)
 
-    # ── Pad all rows to same length ───────────────────────────────────────────
-    for row in clean_table:
-        while len(row) < num_cols:
-            row.append("")
+    line_keys = sorted(lines.keys())
 
-    # ── Find the row where first cell is "2025" ───────────────────────────────
-    year_2025_idx = None
-    for i, row in enumerate(clean_table):
-        if row[0].strip() == "2025":
-            year_2025_idx = i
-            print(f"\nFound '2025' row at index {i}: {row}")
+    def line_text(key):
+        return " ".join(w['text'] for w in sorted(lines[key], key=lambda x: x['x0']))
+
+    # ── Print all lines for debug ─────────────────────────────────────────────
+    print("\nAll lines:")
+    for k in line_keys:
+        print(f"  y={k:4d}: {line_text(k)}")
+
+    # ── Find the header line to get x positions of each column ───────────────
+    # Look for line containing "Ending" and "Equity"
+    header_key = None
+    for k in line_keys:
+        lt = line_text(k).lower()
+        if "ending" in lt and "equity" in lt:
+            header_key = k
             break
 
-    if year_2025_idx is None:
-        # Try partial match — sometimes "2025" is embedded
-        for i, row in enumerate(clean_table):
-            if "2025" in row[0].strip():
-                year_2025_idx = i
-                print(f"\nFound '2025' row at index {i}: {row}")
+    # Also find MTD header line
+    mtd_key = None
+    for k in line_keys:
+        lt = line_text(k).lower()
+        if "mtd" in lt:
+            mtd_key = k
+            break
+
+    print(f"\nHeader line (Ending Equity): y={header_key} → {line_text(header_key) if header_key else 'NOT FOUND'}")
+    print(f"MTD header line           : y={mtd_key}    → {line_text(mtd_key) if mtd_key else 'NOT FOUND'}")
+
+    # ── Get x-center of "Ending Equity" column ────────────────────────────────
+    ending_x = None
+    if header_key:
+        for w in sorted(lines[header_key], key=lambda x: x['x0']):
+            if "ending" in w['text'].lower() or "equity" in w['text'].lower():
+                ending_x = (w['x0'] + w['x1']) / 2
                 break
 
-    if year_2025_idx is None:
-        print("❌ Could not find 2025 year row.")
-        print("First cell of each row:")
-        for i, row in enumerate(clean_table):
-            print(f"  [{i}] '{row[0]}'")
-        return
+    # ── Get x-center of "MTD Rate of Return" column ───────────────────────────
+    mtd_x = None
+    if mtd_key:
+        for w in sorted(lines[mtd_key], key=lambda x: x['x0']):
+            if "mtd" in w['text'].lower():
+                mtd_x = (w['x0'] + w['x1']) / 2
+                break
 
-    # ── Find December row AFTER the 2025 marker ───────────────────────────────
-    dec_row = None
-    for i in range(year_2025_idx + 1, len(clean_table)):
-        row = clean_table[i]
-        if "december" in row[0].lower():
-            dec_row = row
-            print(f"\nFound December 2025 row at index {i}: {row}")
+    print(f"\nEnding Equity x-center : {ending_x}")
+    print(f"MTD Rate of Return x-center: {mtd_x}")
+
+    # ── Find "2025" year marker line ──────────────────────────────────────────
+    year_key = None
+    for k in line_keys:
+        lt = line_text(k).strip()
+        if lt == "2025":
+            year_key = k
             break
 
-    if dec_row is None:
-        print("❌ Could not find December row after 2025.")
-        print("Rows after 2025 marker:")
-        for i in range(year_2025_idx + 1, len(clean_table)):
-            print(f"  [{i}] {clean_table[i]}")
+    if year_key is None:
+        for k in line_keys:
+            lt = line_text(k).strip()
+            if re.match(r'^2025$', lt):
+                year_key = k
+                break
+
+    print(f"\n2025 year marker: y={year_key} → '{line_text(year_key) if year_key else 'NOT FOUND'}'")
+
+    if year_key is None:
+        print("All line texts (checking for 2025):")
+        for k in line_keys:
+            if "2025" in line_text(k):
+                print(f"  y={k}: {line_text(k)}")
         return
 
-    # ── Map column positions ──────────────────────────────────────────────────
-    # From PDF structure (0-indexed):
-    # 0: Period, 1: Beginning Equity, 2: Additions, 3: Withdrawals,
-    # 4: Net Income, 5: Ending Equity, 6: MTD Rate of Return,
-    # 7: YTD Value of $1000, 8: YTD Rate of Return, 9: Inception Value of $1000
+    # ── Find December line AFTER 2025 marker ──────────────────────────────────
+    dec_key = None
+    for k in line_keys:
+        if k <= year_key:
+            continue
+        lt = line_text(k).lower()
+        if lt.startswith("december") or "december" in lt.split()[0].lower() if lt.strip() else False:
+            dec_key = k
+            break
 
-    print(f"\nDecember row values by index:")
-    for i, val in enumerate(dec_row):
-        print(f"  [{i}] '{val}'")
+    print(f"\nDecember 2025 line: y={dec_key} → '{line_text(dec_key) if dec_key else 'NOT FOUND'}'")
 
-    # Ending Equity = index 5, MTD Rate of Return = index 6
-    ending_equity_raw = dec_row[5] if len(dec_row) > 5 else None
-    mtd_return_raw    = dec_row[6] if len(dec_row) > 6 else None
+    if dec_key is None:
+        print("Lines after 2025 marker:")
+        for k in line_keys:
+            if k > year_key:
+                print(f"  y={k}: {line_text(k)}")
+        return
+
+    # ── Extract value closest to Ending Equity x position ────────────────────
+    dec_words = sorted(lines[dec_key], key=lambda w: w['x0'])
+
+    print(f"\nWords in December row:")
+    for w in dec_words:
+        print(f"  x={w['x0']:.1f}-{w['x1']:.1f}  text='{w['text']}'")
+
+    def get_value_at_x(target_x, row_words, tolerance=40):
+        if target_x is None:
+            return None
+        best_word, best_dist = None, float('inf')
+        for w in row_words:
+            wx = (w['x0'] + w['x1']) / 2
+            dist = abs(wx - target_x)
+            if dist < best_dist and dist < tolerance:
+                best_dist = dist
+                best_word = w
+        return best_word['text'] if best_word else None
 
     def clean_number(val):
         if not val or str(val).strip() in ("", "-", "None"):
@@ -107,10 +140,16 @@ def extract_bright_meadow():
         except ValueError:
             return None
 
-    ending_equity = clean_number(ending_equity_raw)
-    mtd_return    = clean_number(mtd_return_raw)
+    ending_raw = get_value_at_x(ending_x, dec_words)
+    mtd_raw    = get_value_at_x(mtd_x,    dec_words)
 
-    # ── Build result DataFrame ────────────────────────────────────────────────
+    print(f"\nRaw Ending Equity value : '{ending_raw}'")
+    print(f"Raw MTD Rate of Return  : '{mtd_raw}'")
+
+    ending_equity = clean_number(ending_raw)
+    mtd_return    = clean_number(mtd_raw)
+
+    # ── Result ────────────────────────────────────────────────────────────────
     result_df = pd.DataFrame([{
         "Fund Name"              : fund_name,
         "Period"                 : "December 2025",
