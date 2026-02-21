@@ -2,10 +2,10 @@ import pdfplumber
 import pandas as pd
 import re
 import os
+from difflib import SequenceMatcher
 
 def extract_fund_data(pdf_path):
     """Extract December ending equity and MTD rate of return from a single PDF."""
-
     try:
         with pdfplumber.open(pdf_path) as pdf:
             page      = pdf.pages[0]
@@ -14,7 +14,6 @@ def extract_fund_data(pdf_path):
 
         fund_name = full_text.strip().split('\n')[0].strip() if full_text else ""
 
-        # ── Group words into lines by y position ─────────────────────────────
         lines = {}
         for w in words:
             key = round(w['top'] / 3) * 3
@@ -28,9 +27,7 @@ def extract_fund_data(pdf_path):
         def line_text(key):
             return " ".join(w['text'] for w in get_line_words(key))
 
-        # ── Dynamically find column x-centers from headers ───────────────────
         col_x = {"ending_equity": None, "mtd_return": None}
-
         for k in line_keys:
             for w in get_line_words(k):
                 wt = w['text'].lower()
@@ -43,7 +40,6 @@ def extract_fund_data(pdf_path):
             print(f"  ⚠ Could not find all column headers in: {os.path.basename(pdf_path)}")
             return None
 
-        # ── Find the most recent year marker ─────────────────────────────────
         year_keys = {}
         for k in line_keys:
             lt = line_text(k).strip()
@@ -57,7 +53,6 @@ def extract_fund_data(pdf_path):
         latest_year     = max(year_keys.keys())
         latest_year_key = year_keys[latest_year]
 
-        # ── Find December row after latest year marker ────────────────────────
         dec_key = None
         for k in line_keys:
             if k <= latest_year_key:
@@ -71,7 +66,6 @@ def extract_fund_data(pdf_path):
             print(f"  ⚠ No December row found in: {os.path.basename(pdf_path)}")
             return None
 
-        # ── Get value nearest to each column x position ───────────────────────
         dec_words = get_line_words(dec_key)
 
         def get_value_near_x(target_x, row_words, tolerance=50):
@@ -99,10 +93,10 @@ def extract_fund_data(pdf_path):
         print(f"  ✅ {fund_name[:60]} | Ending Equity: {ending_equity} | MTD: {mtd_return}")
 
         return {
-            "Fund Name"              : fund_name,
-            "Period"                 : f"December {latest_year}",
-            "Ending Equity"          : ending_equity,
-            "MTD Rate of Return (%)" : mtd_return
+            "Fund Name"    : fund_name,
+            "Period"       : f"December {latest_year}",
+            "Ending Equity": ending_equity,
+            "MTD"          : mtd_return
         }
 
     except Exception as e:
@@ -110,60 +104,183 @@ def extract_fund_data(pdf_path):
         return None
 
 
-def extract_all_funds(folder_path):
-    """Loop through all PDFs in folder and return combined DataFrame."""
+def fuzzy_match(name, candidates, threshold=60):
+    """Match a fund name to the closest candidate using fuzzy scoring."""
+    name = name.lower().strip()
+    best_match, best_score = None, 0
+    for candidate in candidates:
+        c = str(candidate).lower().strip()
+        # Direct substring check first
+        if name in c or c in name:
+            return candidate, 100
+        score = int(SequenceMatcher(None, name, c).ratio() * 100)
+        if score > best_score:
+            best_score = score
+            best_match = candidate
+    if best_score >= threshold:
+        return best_match, best_score
+    return None, best_score
 
-    # ── Change folder path here ───────────────────────────────────────────────
-    folder_path = r"C:\Your\Folder\Path\Here"   # <-- Change this
-    # ─────────────────────────────────────────────────────────────────────────
 
-    pdf_files = [
-        f for f in os.listdir(folder_path)
-        if f.lower().endswith(".pdf")
-    ]
+def get_month_end(date):
+    """Return the last day of the month following the given date."""
+    # Move to first day of month after next
+    next_month = date.replace(day=1) + pd.DateOffset(months=2)
+    # Go back one day to get end of next month
+    return next_month - pd.DateOffset(days=1)
+
+
+def extract_and_merge(folder_path, workflow_path):
+    """
+    1. Extract data from all PDFs in folder_path
+    2. Match with workflow Excel on Fund Name
+    3. Return merged output DataFrame
+    """
+
+    # ── Step 1: Extract from all PDFs ────────────────────────────────────────
+    pdf_files = [f for f in os.listdir(folder_path) if f.lower().endswith(".pdf")]
 
     if not pdf_files:
-        print(f"❌ No PDF files found in: {folder_path}")
+        print(f"❌ No PDFs found in: {folder_path}")
         return None
 
-    print(f"Found {len(pdf_files)} PDF files in folder:\n")
+    print(f"Found {len(pdf_files)} PDFs\n")
 
-    results = []
+    extracted_rows = []
     for i, filename in enumerate(sorted(pdf_files), 1):
-        pdf_path = os.path.join(folder_path, filename)
-        print(f"[{i}/{len(pdf_files)}] Processing: {filename}")
-        result = extract_fund_data(pdf_path)
+        print(f"[{i}/{len(pdf_files)}] {filename}")
+        result = extract_fund_data(os.path.join(folder_path, filename))
         if result:
-            results.append(result)
-        else:
-            # Add a blank row so we know which PDF failed
-            results.append({
-                "Fund Name"              : filename,
-                "Period"                 : "ERROR - Could not extract",
-                "Ending Equity"          : None,
-                "MTD Rate of Return (%)" : None
-            })
+            extracted_rows.append(result)
 
-    # ── Build final DataFrame ─────────────────────────────────────────────────
-    df = pd.DataFrame(results, columns=[
-        "Fund Name",
-        "Period",
-        "Ending Equity",
-        "MTD Rate of Return (%)"
+    if not extracted_rows:
+        print("❌ No data extracted from any PDF.")
+        return None
+
+    extracted_df = pd.DataFrame(extracted_rows)
+    print(f"\n✅ Extracted {len(extracted_df)} funds from PDFs")
+
+    # ── Step 2: Load workflow Excel ───────────────────────────────────────────
+    print(f"\nLoading workflow Excel: {workflow_path}")
+    wf = pd.read_excel(workflow_path)
+
+    print(f"Workflow columns: {wf.columns.tolist()}")
+    print(f"Workflow rows   : {len(wf)}")
+
+    # ── Identify key columns in workflow (flexible naming) ───────────────────
+    def find_col(df, keywords):
+        """Find column name containing any of the keywords (case-insensitive)."""
+        for col in df.columns:
+            col_lower = str(col).lower()
+            if all(kw.lower() in col_lower for kw in keywords):
+                return col
+        # Try any single keyword match
+        for kw in keywords:
+            for col in df.columns:
+                if kw.lower() in str(col).lower():
+                    return col
+        return None
+
+    wf_fund_name_col = find_col(wf, ["fund", "name"])
+    wf_fund_ucn_col  = find_col(wf, ["ucn"])
+    wf_fund_code_col = find_col(wf, ["fund", "code"]) or find_col(wf, ["code"])
+    wf_nav_date_col  = find_col(wf, ["date"])
+    wf_nav_col       = find_col(wf, ["nav"]) 
+    wf_prev_nav_col  = find_col(wf, ["prev"])
+
+    print(f"\nMapped workflow columns:")
+    print(f"  Fund Name : '{wf_fund_name_col}'")
+    print(f"  Fund UCN  : '{wf_fund_ucn_col}'")
+    print(f"  Fund Code : '{wf_fund_code_col}'")
+    print(f"  NAV Date  : '{wf_nav_date_col}'")
+    print(f"  NAV       : '{wf_nav_col}'")
+    print(f"  Prev NAV  : '{wf_prev_nav_col}'")
+
+    # ── Step 3: Match and build output ────────────────────────────────────────
+    wf_names   = wf[wf_fund_name_col].tolist() if wf_fund_name_col else []
+    output_rows = []
+
+    for _, row in extracted_df.iterrows():
+        pdf_fund_name  = row["Fund Name"]
+        ending_equity  = row["Ending Equity"]
+        mtd_val        = row["MTD"]
+
+        # Fuzzy match to workflow
+        matched_name, score = fuzzy_match(pdf_fund_name, wf_names)
+
+        if matched_name:
+            wf_row = wf[wf[wf_fund_name_col] == matched_name].iloc[0]
+            print(f"  ✅ Matched '{pdf_fund_name[:50]}' → '{matched_name[:50]}' (score {score})")
+
+            # Get workflow values
+            fund_ucn  = wf_row[wf_fund_ucn_col]  if wf_fund_ucn_col  else None
+            fund_code = wf_row[wf_fund_code_col]  if wf_fund_code_col else None
+            prev_nav  = wf_row[wf_nav_col]        if wf_nav_col       else None  # NAV in workflow = Prev NAV
+
+            # NAV Date = start_date (from workflow) + next month end
+            start_date = None
+            nav_date   = None
+            if wf_nav_date_col:
+                raw_date = wf_row[wf_nav_date_col]
+                try:
+                    start_date = pd.to_datetime(raw_date)
+                    nav_date   = get_month_end(start_date)
+                    nav_date   = nav_date.strftime("%d %b %Y")
+                except Exception:
+                    nav_date = None
+
+            # Variance = (NAV from PDF - Prev NAV from workflow) / Prev NAV
+            variance = None
+            if ending_equity is not None and prev_nav is not None:
+                try:
+                    prev_nav_float = float(str(prev_nav).replace(',', '').strip())
+                    if prev_nav_float != 0:
+                        variance = round(
+                            (ending_equity - prev_nav_float) / prev_nav_float, 6
+                        )
+                except Exception:
+                    variance = None
+
+        else:
+            print(f"  ⚠ No match found for '{pdf_fund_name[:50]}' (best score {score})")
+            fund_ucn  = None
+            fund_code = None
+            nav_date  = None
+            prev_nav  = None
+            variance  = None
+
+        output_rows.append({
+            "Fund UCN"   : fund_ucn,
+            "Fund Name"  : pdf_fund_name,
+            "Fund Code"  : fund_code,
+            "NAV Date"   : nav_date,
+            "NAV"        : ending_equity,   # extracted ending equity from PDF
+            "MTD"        : mtd_val,         # extracted MTD from PDF
+            "Prev NAV"   : prev_nav,        # NAV value from workflow Excel
+            "Variance"   : variance         # (NAV - Prev NAV) / Prev NAV
+        })
+
+    # ── Step 4: Final DataFrame ───────────────────────────────────────────────
+    output_df = pd.DataFrame(output_rows, columns=[
+        "Fund UCN", "Fund Name", "Fund Code",
+        "NAV Date", "NAV", "MTD", "Prev NAV", "Variance"
     ])
 
     print("\n" + "=" * 70)
-    print("FINAL COMBINED RESULTS:")
+    print("FINAL OUTPUT:")
     print("=" * 70)
-    print(df.to_string(index=False))
+    print(output_df.to_string(index=False))
 
     # ── Save to Excel ─────────────────────────────────────────────────────────
-    output_path = os.path.join(folder_path, "All_Funds_Extracted.xlsx")
-    df.to_excel(output_path, index=False)
+    output_path = os.path.join(folder_path, "Bright_Meadow_Merged_Output.xlsx")
+    output_df.to_excel(output_path, index=False)
     print(f"\nSaved to: {output_path}")
 
-    return df
+    return output_df
 
 
 # ── Run ───────────────────────────────────────────────────────────────────────
-df = extract_all_funds(r"C:\Your\Folder\Path\Here")  # <-- Change this
+folder_path   = r"C:\Your\PDF\Folder\Path"       # <-- Change this
+workflow_path = r"C:\Your\Workflow\File.xlsx"     # <-- Change this
+
+df = extract_and_merge(folder_path, workflow_path)
