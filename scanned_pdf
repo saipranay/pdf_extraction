@@ -4,8 +4,8 @@ import re
 from difflib import SequenceMatcher
 
 def extract_riva_capital():
-    
-    pdf_path = "riva_capital.pdf"          # <-- Change this to your actual path
+
+    pdf_path    = "riva_capital.pdf"  # <-- Change this
     output_path = "Riva_Capital_Output.xlsx"
 
     row_labels = [
@@ -25,18 +25,24 @@ def extract_riva_capital():
         "IRR (Unaffiliated LP's Only)",
     ]
 
-    # ── Extract words from PDF ────────────────────────────────────────────────
+    # ── Extract with tuned parameters to group chars into words ──────────────
     with pdfplumber.open(pdf_path) as pdf:
         page = pdf.pages[0]
-        words = page.extract_words()
 
-    # ── DEBUG: Print all words to find exact month header format ─────────────
-    print("=" * 60)
-    print("ALL WORDS FOUND IN PDF (first 100):")
-    print("=" * 60)
-    for w in words[:100]:
+        # x_tolerance: max horizontal gap between chars to be grouped as one word
+        # y_tolerance: max vertical gap between chars to be grouped as one word
+        words = page.extract_words(
+            x_tolerance=3,
+            y_tolerance=3,
+            keep_blank_chars=False,
+            use_text_flow=False,
+            extra_attrs=["size"]
+        )
+
+    # ── DEBUG: print first 80 words ───────────────────────────────────────────
+    print("First 80 words detected:")
+    for w in words[:80]:
         print(f"  text='{w['text']}'  x0={w['x0']:.1f}  top={w['top']:.1f}")
-    print("=" * 60)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     def fuzzy_score(a, b):
@@ -58,49 +64,6 @@ def extract_riva_capital():
         except ValueError:
             return None
 
-    # ── Detect month column x-positions (broader pattern) ────────────────────
-    # Tries multiple common formats: Jan'25, Jan-25, Jan 25, January 2025, Jun25
-    month_pattern = re.compile(
-        r"^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|YTD)[\s'\-]?\d{2,4}$", re.I
-    )
-
-    header_words = []
-    for w in words:
-        cleaned = w['text'].replace("\u2019", "'").replace("\u2018", "'")
-        if month_pattern.match(cleaned):
-            header_words.append(w)
-
-    # ── If still not found, try to detect by looking for adjacent year numbers ─
-    if not header_words:
-        print("⚠ Standard month pattern failed. Trying alternate detection...")
-        month_names = ["jan","feb","mar","apr","may","jun",
-                       "jul","aug","sep","oct","nov","dec","ytd"]
-        header_words = [
-            w for w in words
-            if w['text'].strip().lower()[:3] in month_names
-        ]
-
-    if not header_words:
-        print("\n❌ Could not detect month headers.")
-        print("Please check the words printed above and share them so the pattern can be fixed.")
-        return
-
-    header_words.sort(key=lambda w: w['x0'])
-    col_x = [(w['text'], w['x0'], w['x1']) for w in header_words]
-    print("Detected columns:", [c[0] for c in col_x])
-    months = [c[0] for c in col_x]  # Use whatever format the PDF actually has
-
-    def assign_col(word):
-        wx = (word['x0'] + word['x1']) / 2
-        best_col, best_dist = None, float('inf')
-        for name, cx0, cx1 in col_x:
-            col_mid = (cx0 + cx1) / 2
-            dist = abs(wx - col_mid)
-            if dist < best_dist:
-                best_dist = dist
-                best_col = name
-        return best_col
-
     # ── Group words into lines by y-position ──────────────────────────────────
     words_sorted = sorted(words, key=lambda w: (round(w['top'] / 4), w['x0']))
     lines = {}
@@ -113,17 +76,74 @@ def extract_riva_capital():
     def line_text(key):
         return " ".join(w['text'] for w in lines[key])
 
-    # ── Match each label to a line and extract values ─────────────────────────
+    # ── DEBUG: print all lines to see full text ───────────────────────────────
+    print("\nAll lines detected:")
+    for k in line_keys:
+        print(f"  y~{k*4:.0f}: {line_text(k)}")
+
+    # ── Detect month columns from lines ───────────────────────────────────────
+    # Since chars may still be split, reconstruct full line text per y and
+    # search for month patterns inside the concatenated line
+    month_names_re = re.compile(
+        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|YTD)[\s'\u2019\-]?\d{2,4}", re.I
+    )
+
+    # Find the header line (line that contains most month names)
+    header_line_key = None
+    max_month_hits  = 0
+    for key in line_keys:
+        lt = line_text(key)
+        hits = len(month_names_re.findall(lt))
+        if hits > max_month_hits:
+            max_month_hits  = hits
+            header_line_key = key
+
+    if not header_line_key or max_month_hits == 0:
+        # Try joining adjacent lines and looking for months as separate words
+        month_short = ["jan","feb","mar","apr","may","jun",
+                       "jul","aug","sep","oct","nov","dec","ytd"]
+        header_words = [w for w in words if w['text'].strip().lower() in month_short]
+        if not header_words:
+            print("\n❌ Still cannot find month headers.")
+            print("Please share the 'All lines detected' output above so we can fix the pattern.")
+            return
+        header_words.sort(key=lambda w: w['x0'])
+        col_x  = [(w['text'], w['x0'], w['x1']) for w in header_words]
+    else:
+        # Extract individual month words from header line
+        header_words = [w for w in lines[header_line_key]
+                        if month_names_re.search(w['text'])
+                        or w['text'].strip().lower()[:3] in
+                           ["jan","feb","mar","apr","may","jun",
+                            "jul","aug","sep","oct","nov","dec","ytd"]]
+        header_words.sort(key=lambda w: w['x0'])
+        col_x = [(w['text'], w['x0'], w['x1']) for w in header_words]
+
+    months = [c[0] for c in col_x]
+    print("\nDetected month columns:", months)
+
+    def assign_col(word):
+        wx = (word['x0'] + word['x1']) / 2
+        best_col, best_dist = None, float('inf')
+        for name, cx0, cx1 in col_x:
+            col_mid = (cx0 + cx1) / 2
+            dist    = abs(wx - col_mid)
+            if dist < best_dist:
+                best_dist = dist
+                best_col  = name
+        return best_col
+
+    # ── Match labels and extract values ───────────────────────────────────────
     output_rows = []
 
     for label in row_labels:
         best_key, best_score = None, 0
         for key in line_keys:
-            lt = line_text(key)
+            lt    = line_text(key)
             score = fuzzy_score(label, lt)
             if score > best_score:
                 best_score = score
-                best_key = key
+                best_key   = key
 
         if best_score < 50:
             print(f"  ⚠ Could not find row: '{label}' (best score {best_score})")
@@ -134,9 +154,9 @@ def extract_riva_capital():
 
         print(f"  ✓ '{label}' → '{line_text(best_key)[:80]}' (score {best_score})")
 
-        matched_line = lines[best_key]
-        next_keys = [k for k in line_keys if k > best_key]
-        extra_words = lines[next_keys[0]] if next_keys else []
+        matched_line     = lines[best_key]
+        next_keys        = [k for k in line_keys if k > best_key]
+        extra_words      = lines[next_keys[0]] if next_keys else []
         all_words_in_row = matched_line + extra_words
 
         row_dict = {"Row Label": label}
@@ -150,7 +170,7 @@ def extract_riva_capital():
 
         output_rows.append(row_dict)
 
-    # ── Build DataFrame and save ──────────────────────────────────────────────
+    # ── Save ──────────────────────────────────────────────────────────────────
     df = pd.DataFrame(output_rows, columns=["Row Label"] + months)
     print("\nExtracted DataFrame:")
     print(df.to_string(index=False))
