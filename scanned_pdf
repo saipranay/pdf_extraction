@@ -6,113 +6,100 @@ def extract_bright_meadow():
 
     pdf_path = "bright_meadow.pdf"  # <-- Change this to your actual path
 
-    # ── Extract fund name and table from PDF ──────────────────────────────────
     with pdfplumber.open(pdf_path) as pdf:
-        page  = pdf.pages[0]
-        
-        # Extract fund name from top text
+        page = pdf.pages[0]
+
+        # Extract fund name
         full_text = page.extract_text()
-        fund_name = ""
-        if full_text:
-            first_line = full_text.strip().split('\n')[0]
-            fund_name  = first_line.strip()
+        fund_name = full_text.strip().split('\n')[0].strip() if full_text else ""
 
         # Extract table
         tables = page.extract_tables()
 
     if not tables:
-        print("❌ No tables found in PDF.")
+        print("❌ No tables found.")
         return
 
-    # ── Use the largest table found ───────────────────────────────────────────
     table = max(tables, key=lambda t: len(t))
 
-    print(f"Fund: {fund_name}")
-    print(f"Table rows found: {len(table)}")
-    print("\nRaw table (first 5 rows):")
-    for row in table[:5]:
-        print(row)
-
-    # ── Convert to DataFrame ──────────────────────────────────────────────────
-    # Flatten multi-line headers by joining non-None cells
+    # ── Clean all cells ───────────────────────────────────────────────────────
     def clean_cell(cell):
         if cell is None:
             return ""
-        return " ".join(cell.split())  # collapse whitespace/newlines
+        return " ".join(str(cell).split())
 
-    # Build clean rows
-    clean_table = [[clean_cell(cell) for cell in row] for row in table]
+    clean_table = [[clean_cell(c) for c in row] for row in table]
 
-    # Find header row (row that contains "Period" or "Ending")
-    header_idx = 0
+    # ── Debug: print all rows with index ─────────────────────────────────────
+    print(f"Fund: {fund_name}")
+    print(f"Total rows: {len(clean_table)}")
+    print("\nAll rows:")
     for i, row in enumerate(clean_table):
-        row_text = " ".join(row).lower()
-        if "period" in row_text or "ending" in row_text:
-            header_idx = i
+        print(f"  [{i:03d}] {row}")
+
+    # ── Find column count from the most populated row ─────────────────────────
+    num_cols = max(len(row) for row in clean_table)
+
+    # ── Pad all rows to same length ───────────────────────────────────────────
+    for row in clean_table:
+        while len(row) < num_cols:
+            row.append("")
+
+    # ── Find the row where first cell is "2025" ───────────────────────────────
+    year_2025_idx = None
+    for i, row in enumerate(clean_table):
+        if row[0].strip() == "2025":
+            year_2025_idx = i
+            print(f"\nFound '2025' row at index {i}: {row}")
             break
 
-    # Merge header rows if split across multiple rows (common in pdfplumber)
-    # Combine rows up to and including header_idx as column names
-    col_names = []
-    for col_i in range(len(clean_table[header_idx])):
-        parts = []
-        for row_i in range(header_idx + 1):
-            val = clean_table[row_i][col_i]
-            if val:
-                parts.append(val)
-        col_names.append(" ".join(parts).strip())
+    if year_2025_idx is None:
+        # Try partial match — sometimes "2025" is embedded
+        for i, row in enumerate(clean_table):
+            if "2025" in row[0].strip():
+                year_2025_idx = i
+                print(f"\nFound '2025' row at index {i}: {row}")
+                break
 
-    print(f"\nDetected columns: {col_names}")
+    if year_2025_idx is None:
+        print("❌ Could not find 2025 year row.")
+        print("First cell of each row:")
+        for i, row in enumerate(clean_table):
+            print(f"  [{i}] '{row[0]}'")
+        return
 
-    # Data rows start after header
-    data_rows = clean_table[header_idx + 1:]
-    df_full   = pd.DataFrame(data_rows, columns=col_names)
-
-    print("\nFull DataFrame:")
-    print(df_full.to_string(index=False))
-
-    # ── Find December 2025 row ────────────────────────────────────────────────
-    # Period column is likely the first column
-    period_col = col_names[0]
-
-    # Find column containing "Ending Equity"
-    ending_col = next((c for c in col_names if "ending" in c.lower() and "equity" in c.lower()), None)
-
-    # Find column containing "MTD Rate of Return"
-    mtd_col = next((c for c in col_names if "mtd" in c.lower() and "rate" in c.lower()), None)
-
-    # Fallback: search by index if names are messy
-    if not ending_col:
-        # Ending Equity is typically column index 4
-        ending_col = col_names[4] if len(col_names) > 4 else None
-    if not mtd_col:
-        # MTD Rate of Return is typically column index 5
-        mtd_col = col_names[5] if len(col_names) > 5 else None
-
-    print(f"\nEnding Equity column : '{ending_col}'")
-    print(f"MTD Rate of Return column: '{mtd_col}'")
-
-    # Find the 2025 December row
-    # Look for year marker "2025" then "December" after it
-    in_2025    = False
-    dec_row    = None
-
-    for _, row in df_full.iterrows():
-        period_val = str(row[period_col]).strip()
-        if period_val == "2025":
-            in_2025 = True
-        if in_2025 and "december" in period_val.lower():
+    # ── Find December row AFTER the 2025 marker ───────────────────────────────
+    dec_row = None
+    for i in range(year_2025_idx + 1, len(clean_table)):
+        row = clean_table[i]
+        if "december" in row[0].lower():
             dec_row = row
+            print(f"\nFound December 2025 row at index {i}: {row}")
             break
 
     if dec_row is None:
-        print("❌ Could not find December 2025 row.")
-        print("Available periods:", df_full[period_col].tolist())
+        print("❌ Could not find December row after 2025.")
+        print("Rows after 2025 marker:")
+        for i in range(year_2025_idx + 1, len(clean_table)):
+            print(f"  [{i}] {clean_table[i]}")
         return
 
-    # ── Clean values ──────────────────────────────────────────────────────────
+    # ── Map column positions ──────────────────────────────────────────────────
+    # From PDF structure (0-indexed):
+    # 0: Period, 1: Beginning Equity, 2: Additions, 3: Withdrawals,
+    # 4: Net Income, 5: Ending Equity, 6: MTD Rate of Return,
+    # 7: YTD Value of $1000, 8: YTD Rate of Return, 9: Inception Value of $1000
+
+    print(f"\nDecember row values by index:")
+    for i, val in enumerate(dec_row):
+        print(f"  [{i}] '{val}'")
+
+    # Ending Equity = index 5, MTD Rate of Return = index 6
+    ending_equity_raw = dec_row[5] if len(dec_row) > 5 else None
+    mtd_return_raw    = dec_row[6] if len(dec_row) > 6 else None
+
     def clean_number(val):
-        if val is None or str(val).strip() in ("", "-", "None"):
+        if not val or str(val).strip() in ("", "-", "None"):
             return None
         v = str(val).replace(',', '').replace('$', '').replace('%', '').strip()
         try:
@@ -120,10 +107,10 @@ def extract_bright_meadow():
         except ValueError:
             return None
 
-    ending_equity = clean_number(dec_row[ending_col])
-    mtd_return    = clean_number(dec_row[mtd_col])
+    ending_equity = clean_number(ending_equity_raw)
+    mtd_return    = clean_number(mtd_return_raw)
 
-    # ── Build output DataFrame ────────────────────────────────────────────────
+    # ── Build result DataFrame ────────────────────────────────────────────────
     result_df = pd.DataFrame([{
         "Fund Name"              : fund_name,
         "Period"                 : "December 2025",
@@ -137,5 +124,4 @@ def extract_bright_meadow():
     return result_df
 
 
-# ── Run ───────────────────────────────────────────────────────────────────────
 df = extract_bright_meadow()
