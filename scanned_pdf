@@ -1,4 +1,4 @@
-import pdfplumber
+import pikepdf
 import pandas as pd
 import re
 from difflib import SequenceMatcher
@@ -25,24 +25,160 @@ def extract_riva_capital():
         "IRR (Unaffiliated LP's Only)",
     ]
 
-    # ── Extract with tuned parameters to group chars into words ──────────────
-    with pdfplumber.open(pdf_path) as pdf:
+    # ── Extract raw text stream from PDF using pikepdf ────────────────────────
+    print("Opening PDF with pikepdf...")
+    all_text_chunks = []
+
+    with pikepdf.open(pdf_path) as pdf:
         page = pdf.pages[0]
 
-        # x_tolerance: max horizontal gap between chars to be grouped as one word
-        # y_tolerance: max vertical gap between chars to be grouped as one word
-        words = page.extract_words(
-            x_tolerance=3,
-            y_tolerance=3,
-            keep_blank_chars=False,
-            use_text_flow=False,
-            extra_attrs=["size"]
-        )
+        # Get the raw content stream
+        if "/Contents" in page:
+            contents = page["/Contents"]
 
-    # ── DEBUG: print first 80 words ───────────────────────────────────────────
-    print("First 80 words detected:")
-    for w in words[:80]:
-        print(f"  text='{w['text']}'  x0={w['x0']:.1f}  top={w['top']:.1f}")
+            # Contents can be a single stream or an array of streams
+            if isinstance(contents, pikepdf.Array):
+                streams = list(contents)
+            else:
+                streams = [contents]
+
+            for stream in streams:
+                raw = stream.read_bytes()
+                text = raw.decode("latin-1", errors="replace")
+                all_text_chunks.append(text)
+
+    raw_stream = "\n".join(all_text_chunks)
+
+    print("=" * 80)
+    print("RAW STREAM (first 3000 chars):")
+    print("=" * 80)
+    print(raw_stream[:3000])
+    print("=" * 80)
+
+    # ── Extract text using PDF text operators (Tj, TJ, TD, Tm etc.) ──────────
+    # These are standard PDF operators that carry actual text
+    extracted_items = []  # list of (x, y, text)
+
+    # Current text position tracking
+    curr_x, curr_y = 0, 0
+    curr_font_size = 1
+
+    # Pattern to match text positioning + text operators
+    # Tm sets the text matrix: a b c d x y Tm
+    tm_pattern  = re.compile(
+        r'([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+([-\d.]+)\s+Tm'
+    )
+    # Td/TD moves text position
+    td_pattern  = re.compile(r'([-\d.]+)\s+([-\d.]+)\s+T[dD]')
+    # Tj shows a string
+    tj_pattern  = re.compile(r'\((.*?)\)\s*Tj', re.DOTALL)
+    # TJ shows array of strings/numbers
+    tj_arr_pattern = re.compile(r'\[(.*?)\]\s*TJ', re.DOTALL)
+    # String inside TJ
+    tj_str_pattern = re.compile(r'\((.*?)\)')
+
+    # Split stream into tokens/lines for sequential processing
+    tokens = raw_stream.split('\n')
+
+    for line in tokens:
+        line = line.strip()
+
+        # Update position from Tm
+        tm_match = tm_pattern.search(line)
+        if tm_match:
+            curr_x = float(tm_match.group(5))
+            curr_y = float(tm_match.group(6))
+
+        # Update position from Td
+        td_match = td_pattern.search(line)
+        if td_match:
+            curr_x += float(td_match.group(1))
+            curr_y += float(td_match.group(2))
+
+        # Extract text from Tj
+        for m in tj_pattern.finditer(line):
+            txt = m.group(1)
+            txt = txt.replace('\\(', '(').replace('\\)', ')').replace('\\\\', '\\')
+            if txt.strip():
+                extracted_items.append((curr_x, curr_y, txt))
+
+        # Extract text from TJ array
+        for m in tj_arr_pattern.finditer(line):
+            arr_content = m.group(1)
+            parts = []
+            for sm in tj_str_pattern.finditer(arr_content):
+                s = sm.group(1)
+                s = s.replace('\\(', '(').replace('\\)', ')').replace('\\\\', '\\')
+                parts.append(s)
+            combined = "".join(parts)
+            if combined.strip():
+                extracted_items.append((curr_x, curr_y, combined))
+
+    print(f"\nTotal text items extracted: {len(extracted_items)}")
+    print("\nFirst 80 text items:")
+    for item in extracted_items[:80]:
+        print(f"  x={item[0]:.1f}  y={item[1]:.1f}  text='{item[2]}'")
+
+    if not extracted_items:
+        print("\n❌ No text found in PDF stream.")
+        print("This PDF is a pure image scan — text is stored as pixels, not characters.")
+        print("You need OCR to read it. Options:")
+        print("  • Open in Adobe Acrobat → Tools → Scan & OCR → Recognize Text → Save")
+        print("  • Open in Microsoft Word (it auto-OCRs) → copy table to Excel")
+        return
+
+    # ── Group items into lines by y-position ──────────────────────────────────
+    lines_dict = {}
+    for x, y, text in extracted_items:
+        key = round(y / 3) * 3   # group within 3 units
+        lines_dict.setdefault(key, []).append((x, text))
+
+    line_keys = sorted(lines_dict.keys(), reverse=True)  # PDF y increases downward
+
+    def line_text(key):
+        items = sorted(lines_dict[key], key=lambda t: t[0])
+        return " ".join(t[1] for t in items)
+
+    print("\nAll lines:")
+    for k in line_keys:
+        print(f"  y~{k}: {line_text(k)}")
+
+    # ── Detect month columns ──────────────────────────────────────────────────
+    month_pattern_re = re.compile(
+        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|YTD)[\s'\u2019\-]?\d{2,4}", re.I
+    )
+
+    header_key = None
+    max_hits   = 0
+    for key in line_keys:
+        hits = len(month_pattern_re.findall(line_text(key)))
+        if hits > max_hits:
+            max_hits   = hits
+            header_key = key
+
+    if not header_key or max_hits == 0:
+        print("\n❌ Could not find month headers in extracted text.")
+        return
+
+    print(f"\nHeader line: {line_text(header_key)}")
+
+    # Build col_x from x positions of month words in header line
+    col_x = []
+    for x, text in sorted(lines_dict[header_key], key=lambda t: t[0]):
+        if month_pattern_re.search(text):
+            col_x.append((text, x))
+
+    months = [c[0] for c in col_x]
+    print(f"Months: {months}")
+
+    def assign_col(x_pos):
+        best_col, best_dist = None, float('inf')
+        for name, cx in col_x:
+            dist = abs(x_pos - cx)
+            if dist < best_dist:
+                best_dist = dist
+                best_col  = name
+        return best_col
 
     # ── Helpers ───────────────────────────────────────────────────────────────
     def fuzzy_score(a, b):
@@ -53,7 +189,7 @@ def extract_riva_capital():
 
     def is_number(text):
         t = text.strip()
-        return bool(re.match(r'^[-]?\(?\d[\d,\.]*\)?%?$', t)) or t in ['-', '$']
+        return bool(re.match(r'^[-]?\(?\d[\d,\.]*\)?%?$', t))
 
     def clean_number(text):
         t = text.strip().replace(',', '').replace('$', '').replace('%', '')
@@ -64,89 +200,19 @@ def extract_riva_capital():
         except ValueError:
             return None
 
-    # ── Group words into lines by y-position ──────────────────────────────────
-    words_sorted = sorted(words, key=lambda w: (round(w['top'] / 4), w['x0']))
-    lines = {}
-    for w in words_sorted:
-        key = round(w['top'] / 4)
-        lines.setdefault(key, []).append(w)
-
-    line_keys = sorted(lines.keys())
-
-    def line_text(key):
-        return " ".join(w['text'] for w in lines[key])
-
-    # ── DEBUG: print all lines to see full text ───────────────────────────────
-    print("\nAll lines detected:")
-    for k in line_keys:
-        print(f"  y~{k*4:.0f}: {line_text(k)}")
-
-    # ── Detect month columns from lines ───────────────────────────────────────
-    # Since chars may still be split, reconstruct full line text per y and
-    # search for month patterns inside the concatenated line
-    month_names_re = re.compile(
-        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec|YTD)[\s'\u2019\-]?\d{2,4}", re.I
-    )
-
-    # Find the header line (line that contains most month names)
-    header_line_key = None
-    max_month_hits  = 0
-    for key in line_keys:
-        lt = line_text(key)
-        hits = len(month_names_re.findall(lt))
-        if hits > max_month_hits:
-            max_month_hits  = hits
-            header_line_key = key
-
-    if not header_line_key or max_month_hits == 0:
-        # Try joining adjacent lines and looking for months as separate words
-        month_short = ["jan","feb","mar","apr","may","jun",
-                       "jul","aug","sep","oct","nov","dec","ytd"]
-        header_words = [w for w in words if w['text'].strip().lower() in month_short]
-        if not header_words:
-            print("\n❌ Still cannot find month headers.")
-            print("Please share the 'All lines detected' output above so we can fix the pattern.")
-            return
-        header_words.sort(key=lambda w: w['x0'])
-        col_x  = [(w['text'], w['x0'], w['x1']) for w in header_words]
-    else:
-        # Extract individual month words from header line
-        header_words = [w for w in lines[header_line_key]
-                        if month_names_re.search(w['text'])
-                        or w['text'].strip().lower()[:3] in
-                           ["jan","feb","mar","apr","may","jun",
-                            "jul","aug","sep","oct","nov","dec","ytd"]]
-        header_words.sort(key=lambda w: w['x0'])
-        col_x = [(w['text'], w['x0'], w['x1']) for w in header_words]
-
-    months = [c[0] for c in col_x]
-    print("\nDetected month columns:", months)
-
-    def assign_col(word):
-        wx = (word['x0'] + word['x1']) / 2
-        best_col, best_dist = None, float('inf')
-        for name, cx0, cx1 in col_x:
-            col_mid = (cx0 + cx1) / 2
-            dist    = abs(wx - col_mid)
-            if dist < best_dist:
-                best_dist = dist
-                best_col  = name
-        return best_col
-
     # ── Match labels and extract values ───────────────────────────────────────
     output_rows = []
 
     for label in row_labels:
         best_key, best_score = None, 0
         for key in line_keys:
-            lt    = line_text(key)
-            score = fuzzy_score(label, lt)
+            score = fuzzy_score(label, line_text(key))
             if score > best_score:
                 best_score = score
                 best_key   = key
 
         if best_score < 50:
-            print(f"  ⚠ Could not find row: '{label}' (best score {best_score})")
+            print(f"  ⚠ Could not find: '{label}'")
             row_dict = {"Row Label": label}
             row_dict.update({m: None for m in months})
             output_rows.append(row_dict)
@@ -154,19 +220,14 @@ def extract_riva_capital():
 
         print(f"  ✓ '{label}' → '{line_text(best_key)[:80]}' (score {best_score})")
 
-        matched_line     = lines[best_key]
-        next_keys        = [k for k in line_keys if k > best_key]
-        extra_words      = lines[next_keys[0]] if next_keys else []
-        all_words_in_row = matched_line + extra_words
-
         row_dict = {"Row Label": label}
         row_dict.update({m: None for m in months})
 
-        for w in all_words_in_row:
-            if is_number(w['text']):
-                col = assign_col(w)
+        for x, text in lines_dict[best_key]:
+            if is_number(text):
+                col = assign_col(x)
                 if col and row_dict.get(col) is None:
-                    row_dict[col] = clean_number(w['text'])
+                    row_dict[col] = clean_number(text)
 
         output_rows.append(row_dict)
 
