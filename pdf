@@ -1,2 +1,180 @@
 
-pdfff
+"""
+NAV Workflow Mapper - Continuation of day_nav8.py
+--------------------------------------------------
+Paste this code AFTER the existing day_nav8.py code (after line 86).
+It takes the df returned by extract_from_pdf() and maps it with
+the workflow Excel to produce the final output Excel.
+
+Required columns in df (from day_nav8.py):
+    - Fund         : fund name/code e.g. "GH INTL", "ACPI, LP"
+    - Net Assets   : net asset value as number
+    - Month to Date: MTD % as float e.g. -9.6
+
+Usage (append to day_nav8.py):
+    Just set WORKFLOW_PATH and the last line calls map_and_export(df) automatically.
+"""
+
+import pandas as pd
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+# ── CONFIG ──────────────────────────────────────────────────────────────────
+WORKFLOW_PATH = r"G:\2 - Transitory Records\NAV\Hedge Funds\12_31_2025 Workflow.xlsx"
+OUTPUT_PATH   = r"G:\2 - Transitory Records\NAV\Hedge Funds\NAV_Output.xlsx"
+
+# Maps Fund name in your PDF df  →  Fund Code in workflow sheet
+# Update keys if PDF fund names differ from workflow Fund Code column
+FUND_CODE_MAP = {
+    "GH INTL":   "GH INTL",
+    "ACPI, LP":  "ACPI, LP",
+    "ACPII, LP": "ACPII, LP",
+    "WCP, LP":   "WCP, LP",
+}
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def find_col(df_cols, candidates):
+    """Return first matching column name (case-insensitive)."""
+    cols_lower = {c.lower(): c for c in df_cols}
+    for cand in candidates:
+        if cand.lower() in cols_lower:
+            return cols_lower[cand.lower()]
+    return None
+
+
+def load_workflow(path):
+    """Load workflow sheet and return as DataFrame."""
+    xl = pd.ExcelFile(path)
+    sheet_name = next((s for s in xl.sheet_names if "workflow" in s.lower()), xl.sheet_names[0])
+    print(f"[Workflow] Reading sheet: '{sheet_name}'")
+
+    raw = pd.read_excel(path, sheet_name=sheet_name, header=0, dtype=str)
+
+    # Auto-detect header row by looking for 'Fund' keyword
+    for i, row in raw.iterrows():
+        if any("fund" in str(v).lower() for v in row.values):
+            raw = pd.read_excel(path, sheet_name=sheet_name, header=i, dtype=str)
+            break
+
+    raw.columns = [str(c).strip() for c in raw.columns]
+    return raw
+
+
+def map_and_export(extracted_df):
+    """
+    Main function: merges extracted_df with workflow and writes output Excel.
+
+    Parameters
+    ----------
+    extracted_df : pd.DataFrame
+        DataFrame returned by extract_from_pdf() in day_nav8.py.
+        Must have columns: 'Fund', 'Net Assets', 'Month to Date'
+    """
+    # ── 1. Load workflow ────────────────────────────────────────────────────
+    wf = load_workflow(WORKFLOW_PATH)
+
+    col_ucn  = find_col(wf.columns, ["Fund UCN", "UCN"])
+    col_name = find_col(wf.columns, ["Fund Name", "Name"])
+    col_code = find_col(wf.columns, ["Fund Code", "FundCode"])
+    col_nav  = find_col(wf.columns, ["NAV (thous)", "NAV(thous)", "NAV"])
+    col_date = find_col(wf.columns, ["DATE", "NAV Date", "Nav Date"])
+
+    print(f"[Workflow] Columns → UCN:{col_ucn} | Name:{col_name} | "
+          f"Code:{col_code} | NAV:{col_nav} | Date:{col_date}")
+
+    # ── 2. Build output rows ────────────────────────────────────────────────
+    rows = []
+    for _, ext_row in extracted_df.iterrows():
+        pdf_fund   = str(ext_row["Fund"]).strip()
+        fund_code  = FUND_CODE_MAP.get(pdf_fund, pdf_fund)   # map to workflow code
+        net_assets = float(str(ext_row["Net Assets"]).replace(",", "").replace("$", ""))
+        mtd_pct    = float(ext_row["Month to Date"])          # e.g. -9.6
+
+        # Match in workflow by Fund Code
+        if col_code:
+            mask  = wf[col_code].str.strip().str.upper() == fund_code.strip().upper()
+            match = wf[mask]
+        else:
+            match = pd.DataFrame()
+
+        if match.empty:
+            print(f"[WARNING] No workflow match for Fund Code '{fund_code}' — skipping.")
+            continue
+
+        wf_row = match.iloc[0]
+
+        # NAV in thousands
+        nav_thous = net_assets / 1000
+
+        # Prev NAV = NAV / (1 + MTD/100)
+        divisor  = 1 + mtd_pct / 100
+        prev_nav = nav_thous / divisor if divisor != 0 else nav_thous
+        variance = nav_thous - prev_nav
+
+        rows.append({
+            "Fund UCN":          wf_row[col_ucn]  if col_ucn  else "",
+            "Fund Name":         wf_row[col_name] if col_name else pdf_fund,
+            "Fund Code":         fund_code,
+            "NAV Date":          wf_row[col_date] if col_date else "",
+            "NAV (thous)":       round(nav_thous,  3),
+            "MTD (%)":           mtd_pct,
+            "Prev NAV (thous)":  round(prev_nav,   3),
+            "Variance (thous)":  round(variance,   3),
+        })
+
+    if not rows:
+        print("[ERROR] No rows mapped. Check FUND_CODE_MAP keys match your PDF fund names.")
+        return
+
+    out_df = pd.DataFrame(rows)
+    print("\n[Output Preview]")
+    print(out_df.to_string(index=False))
+
+    # ── 3. Write formatted Excel ────────────────────────────────────────────
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "NAV Output"
+
+    thin   = Side(style="thin", color="AAAAAA")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    # Header row
+    ws.row_dimensions[1].height = 28
+    h_fill = PatternFill("solid", fgColor="1F4E79")
+    h_font = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+    for ci, h in enumerate(out_df.columns, 1):
+        c = ws.cell(row=1, column=ci, value=h)
+        c.fill = h_fill; c.font = h_font; c.alignment = center; c.border = border
+
+    # Data rows
+    alt  = PatternFill("solid", fgColor="DCE6F1")
+    wht  = PatternFill("solid", fgColor="FFFFFF")
+    dfnt = Font(name="Arial", size=10)
+
+    for ri, (_, row) in enumerate(out_df.iterrows(), 2):
+        fill = alt if ri % 2 == 0 else wht
+        for ci, val in enumerate(row.values, 1):
+            c = ws.cell(row=ri, column=ci, value=val)
+            c.font = dfnt; c.border = border; c.fill = fill
+            hdr = out_df.columns[ci - 1]
+            if any(k in hdr for k in ("NAV", "Prev", "Variance")):
+                c.number_format = "#,##0.000"
+            elif "MTD" in hdr:
+                c.number_format = '0.0"%"'
+
+    # Column widths
+    for ci, w in enumerate([14, 30, 12, 14, 16, 10, 18, 18], 1):
+        ws.column_dimensions[get_column_letter(ci)].width = w
+
+    ws.freeze_panes = "A2"
+    wb.save(OUTPUT_PATH)
+    print(f"\n[Done] Output saved → {OUTPUT_PATH}")
+
+
+# ── ENTRY POINT ──────────────────────────────────────────────────────────────
+# df is already defined above by: df = extract_from_pdf(PDF_PATH)
+# print(df) — already called in day_nav8.py line 86
+map_and_export(df)
