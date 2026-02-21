@@ -67,7 +67,6 @@ def load_workflow(path):
 
 
 def map_and_export(extracted_df):
-    # ── 1. Load workflow ─────────────────────────────────────────────────────
     wf = load_workflow(WORKFLOW_PATH)
 
     col_ucn  = find_col(wf.columns, ["Fund UCN", "UCN"])
@@ -79,13 +78,12 @@ def map_and_export(extracted_df):
     print(f"[Workflow] Columns → UCN:{col_ucn} | Name:{col_name} | "
           f"Code:{col_code} | NAV:{col_nav} | Date:{col_date}")
 
-    # ── 2. Build output rows ─────────────────────────────────────────────────
     rows = []
     for _, ext_row in extracted_df.iterrows():
         pdf_fund   = str(ext_row["Fund"]).strip()
         fund_code  = FUND_CODE_MAP.get(pdf_fund, pdf_fund)
         net_assets = float(str(ext_row["Net Assets"]).replace(",", "").replace("$", ""))
-        mtd_pct    = float(ext_row["Month to Date"])
+        mtd_pct    = float(ext_row["Month to Date"])        # rule 3: plain float
 
         if col_code:
             mask  = wf[col_code].str.strip().str.upper() == fund_code.strip().upper()
@@ -99,14 +97,20 @@ def map_and_export(extracted_df):
 
         wf_row = match.iloc[0]
 
+        # rule 1: NAV = Net Assets / 1000, integer
         nav_val = int(round(net_assets / 1000, 0))
 
+        # rule 2: Prev NAV = workflow NAV column, integer
         try:
-            prev_nav = int(round(float(str(wf_row[col_nav]).replace(",", "").replace("$", "")), 0)) if col_nav else 0
+            prev_nav = int(round(float(
+                str(wf_row[col_nav]).replace(",", "").replace("$", "")
+            ), 0)) if col_nav else 0
         except (ValueError, TypeError):
             prev_nav = 0
 
-        variance = int(round((nav_val - prev_nav) / prev_nav, 0)) if prev_nav != 0 else 0
+        # rule 4: Variance = (NAV - Prev NAV) / Prev NAV — plain float result
+        variance = round(abs((nav_val - prev_nav) / prev_nav), 2) if prev_nav != 0 else 0.0
+
         nav_date = next_month_last_date(wf_row[col_date] if col_date else "")
 
         rows.append({
@@ -114,23 +118,23 @@ def map_and_export(extracted_df):
             "Fund Name":        wf_row[col_name] if col_name else pdf_fund,
             "Fund Code":        fund_code,
             "NAV Date":         nav_date,
-            "NAV (thous)":      nav_val,
-            "MTD":              mtd_pct,
-            "Prev NAV (thous)": prev_nav,
-            "Variance":         variance,
+            "NAV (thous)":      nav_val,          # rule 1
+            "MTD":              mtd_pct,           # rule 3
+            "Prev NAV (thous)": prev_nav,          # rule 2
+            "Variance":         variance,          # rule 4
         })
 
     if not rows:
         print("[ERROR] No rows mapped. Check FUND_CODE_MAP keys match PDF fund names.")
         return
 
-    # Sort ascending by Variance
+    # rule 5: sort ascending by Variance
     out_df = pd.DataFrame(rows).sort_values("Variance", ascending=True).reset_index(drop=True)
 
     print("\n[Output Preview]")
     print(out_df.to_string(index=False))
 
-    # ── 3. Write plain Excel (no colours, no fills) ───────────────────────────
+    # Write plain Excel — no colours, no borders, no fills
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "NAV Output"
@@ -138,24 +142,24 @@ def map_and_export(extracted_df):
     bold   = Font(name="Calibri", bold=True, size=11)
     normal = Font(name="Calibri", size=11)
 
-    # Header row — bold, no fill
+    # Header — bold only
     for ci, h in enumerate(out_df.columns, 1):
         c = ws.cell(row=1, column=ci, value=h)
-        c.font   = bold
+        c.font      = bold
         c.alignment = Alignment(horizontal="center", vertical="center")
 
-    # Data rows — plain, no colours
+    # Data rows
     for ri, (_, row) in enumerate(out_df.iterrows(), 2):
         for ci, val in enumerate(row.values, 1):
-            c = ws.cell(row=ri, column=ci, value=val)
-            c.font   = normal
+            c   = ws.cell(row=ri, column=ci, value=val)
+            c.font = normal
             hdr = out_df.columns[ci - 1]
             if hdr in ("NAV (thous)", "Prev NAV (thous)"):
-                c.number_format = "#,##0"
+                c.number_format = "#,##0"        # integer, no decimals
             elif hdr == "MTD":
-                c.number_format = "0.0"
+                c.number_format = "0.0"          # plain float, no %
             elif hdr == "Variance":
-                c.number_format = "0"           # rounded to integer, no decimals
+                c.number_format = "General"
 
     # Column widths
     for ci, w in enumerate([14, 30, 12, 16, 16, 8, 18, 14], 1):
